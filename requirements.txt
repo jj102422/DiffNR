@@ -16,3 +16,4 @@ requests
 plyfile
 scikit-image
 open3d
+SimpleITK

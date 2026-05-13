@@ -9,7 +9,7 @@ lambda_tv: 0.05
 tv_vol_size: 32
 
 # Diffusion enhancement losses
-lambda_diffusion_ssim: 1.0
+lambda_diffusion_ssim: 0.0
 lambda_diffusion_l1: 0.0
 diffusion_tv_size: 0
 
