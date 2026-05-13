@@ -20,3 +20,52 @@ env/
 # Logs
 *.log
 events.out.tfevents.*
+
+# Experiment artifacts (keep local, do not commit)
+wandb/
+outputs/
+
+# Generated result files under artifact dirs
+wandb/**/*.png
+wandb/**/*.json
+wandb/**/*.txt
+wandb/**/*.yaml
+outputs/**/*.png
+outputs/**/*.json
+outputs/**/*.txt
+outputs/**/*.yaml
+# Python cache/build
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE/system files
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Logs
+*.log
+events.out.tfevents.*
+
+# =========================
+# 新增：忽略实验结果与配置相关文件
+# =========================
+*.png
+*.json
+*.txt
+*.yaml
+*.yml
+*.pkl
+
+# 新增：忽略 Weights & Biases (wandb) 的本地运行记录
+wandb/

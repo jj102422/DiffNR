@@ -626,7 +626,6 @@ def training_report(
         # Evaluate 3D reconstruction performance
         vol_pred = queryFunc(scene.gaussians)["vol"]
         vol_gt = scene.vol_gt
-        
         psnr_3d, _ = metric_vol(vol_gt, vol_pred, "psnr")
         ssim_3d, ssim_3d_axis = metric_vol(vol_gt, vol_pred, "ssim")
         eval_dict = {
