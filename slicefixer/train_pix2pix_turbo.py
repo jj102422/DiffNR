@@ -21,6 +21,22 @@ from diffusers.optimization import get_scheduler
 import wandb
 from cleanfid.fid import get_folder_features, build_feature_extractor, fid_from_feats
 
+
+# 兼容旧版/第三方依赖里未显式传 `indexing` 的 torch.meshgrid 调用，
+# 统一默认补成 `indexing="ij"`，避免 PyTorch 未来版本的警告。
+_orig_torch_meshgrid = torch.meshgrid
+
+
+def meshgrid_with_default_indexing(*tensors, indexing=None):
+    if len(tensors) == 1 and isinstance(tensors[0], (list, tuple)):
+        tensors = tuple(tensors[0])
+    if indexing is None:
+        indexing = "ij"
+    return _orig_torch_meshgrid(*tensors, indexing=indexing)
+
+
+torch.meshgrid = meshgrid_with_default_indexing
+
 # from pix2pix_turbo import Pix2Pix_Turbo
 import sys
 sys.path.append("./slicefixer") # 确保能索引到 DiffNR 里的 slicefixer 模块
@@ -33,6 +49,27 @@ try:
     FUSED_SSIM_AVAILABLE = True
 except Exception:
     FUSED_SSIM_AVAILABLE = False
+
+
+def normalize_to_255(img):
+    # wandb.Image 期望输入图像在 [0, 255] 范围内；这里把训练/验证时的
+    # 归一化图像从 [-1, 1] 转回可视化范围，避免 wandb 的范围警告。
+    img = img.detach().cpu().float()
+    img = (img + 1.0) * 127.5
+    return img.clamp(0, 255).to(torch.uint8)
+
+
+def unique_parameters(params):
+    # 收集优化器参数时按对象 id 去重，避免同一个参数被重复加入参数组。
+    unique = []
+    seen = set()
+    for param in params:
+        param_id = id(param)
+        if param_id in seen:
+            continue
+        seen.add(param_id)
+        unique.append(param)
+    return unique
 
 
 class MedicalCTDataset(torch.utils.data.Dataset):
@@ -77,7 +114,8 @@ class MedicalCTDataset(torch.utils.data.Dataset):
         coarse_slice = coarse_vol[slice_idx]
         gt_slice = gt_vol[slice_idx]
 
-        coarse_tensor = torch.from_numpy(coarse_slice).float().unsqueeze(0)
+        # 这里需要 copy 一份，避免 mmap 读出的只读 numpy 数组直接转 tensor 时触发警告。
+        coarse_tensor = torch.from_numpy(coarse_slice.copy()).float().unsqueeze(0)
         gt_tensor = torch.from_numpy(gt_slice).float().unsqueeze(0)
 
         coarse_tensor = coarse_tensor.repeat(3, 1, 1)
@@ -151,7 +189,7 @@ def main(args):
 
     net_lpips.requires_grad_(False)
 
-    # make the optimizer
+    # 只把需要训练的 LoRA / skip / conv 参数放进优化器，随后再做一次去重。
     layers_to_opt = []
     for n, _p in net_pix2pix.unet.named_parameters():
         if "lora" in n:
@@ -166,6 +204,8 @@ def main(args):
         list(net_pix2pix.vae.decoder.skip_conv_2.parameters()) + \
         list(net_pix2pix.vae.decoder.skip_conv_3.parameters()) + \
         list(net_pix2pix.vae.decoder.skip_conv_4.parameters())
+    # 防止 conv_in、skip_conv 或 LoRA 参数在不同收集路径中被重复加入。
+    layers_to_opt = unique_parameters(layers_to_opt)
 
     # 【FP16 梯度修复】确保所有可训练参数保持 FP32，避免 GradScaler unscale 崩溃
     for name, param in net_pix2pix.named_parameters():
@@ -387,10 +427,11 @@ def main(args):
 
                     # viz some images
                     if global_step % args.viz_freq == 1:
+                        # 训练阶段把当前 batch 的 input / target / output 三个子图发到 wandb。
                         log_dict = {
-                            "train/input": [wandb.Image(x_src[idx].float().detach().cpu(), caption=f"input_{idx}") for idx in range(B)],
-                            "train/target": [wandb.Image(x_tgt[idx].float().detach().cpu(), caption=f"target(GT)_{idx}") for idx in range(B)],
-                            "train/output": [wandb.Image(x_tgt_pred[idx].float().detach().cpu(), caption=f"output_{idx}") for idx in range(B)],
+                            "train/input": [wandb.Image(normalize_to_255(x_src[idx]), caption=f"input_{idx}") for idx in range(B)],
+                            "train/target": [wandb.Image(normalize_to_255(x_tgt[idx]), caption=f"target(GT)_{idx}") for idx in range(B)],
+                            "train/output": [wandb.Image(normalize_to_255(x_tgt_pred[idx]), caption=f"output_{idx}") for idx in range(B)],
                         }
                         for k in log_dict:
                             logs[k] = log_dict[k]
@@ -442,6 +483,13 @@ def main(args):
                         logs["val/l2"] = np.mean(l_l2)
                         logs["val/lpips"] = np.mean(l_lpips)
                         logs["val/clipsim"] = np.mean(l_clipsim)
+                        
+                        # 验证阶段也同步记录三张图，方便直接对比 input / target / output。
+                        # 这里保留最后一个 val batch 的结果作为可视化样本。
+                        logs["val/input"] = [wandb.Image(normalize_to_255(x_src[0]), caption="val_input")]
+                        logs["val/target"] = [wandb.Image(normalize_to_255(x_tgt[0]), caption="val_target")]
+                        logs["val/output"] = [wandb.Image(normalize_to_255(x_tgt_pred[0]), caption="val_output")]
+                        
                         gc.collect()
                         torch.cuda.empty_cache()
                     accelerator.log(logs, step=global_step)
