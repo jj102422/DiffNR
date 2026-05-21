@@ -4,7 +4,7 @@ from pathlib import Path
 
 # 1. 设置输入与输出路径
 base_dir = Path(
-    "/home/public/CTSpine1K/data/data-MHD_ctpro_woMask1/volume-covid19-A-0237_ct/"
+    "/home/public/CTSpine1K/data/data-MHD_ctpro_woMask1/volume-covid19-A-0382_ct/"
 )
 npy_files = [
     base_dir / "vol_pred.npy",

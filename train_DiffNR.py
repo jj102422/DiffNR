@@ -12,6 +12,7 @@
 import os
 import os.path as osp
 import torch
+import torch.distributed as dist
 import sys
 import numpy as np
 import cv2
@@ -48,6 +49,52 @@ try:
 except:
     FUSED_SSIM_AVAILABLE = False
 print(f"Fused SSIM available: {FUSED_SSIM_AVAILABLE}")
+
+# ============== Distributed Training Utilities ==============
+def init_distributed_mode():
+    """Initialize distributed training environment."""
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        rank = int(os.environ["RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        gpu = int(os.environ["LOCAL_RANK"])
+    else:
+        rank = 0
+        world_size = 1
+        gpu = 0
+    
+    torch.cuda.set_device(gpu)
+    if world_size > 1:
+        dist.init_process_group(
+            backend="nccl",
+            init_method="env://",
+            rank=rank,
+            world_size=world_size,
+            timeout=torch.distributed.timedelta(minutes=30)
+        )
+    
+    return rank, world_size, gpu
+
+def is_main_process():
+    """Check if current process is main process."""
+    return int(os.environ.get("RANK", 0)) == 0
+
+def print_rank0(*args, **kwargs):
+    """Print only from main process."""
+    if is_main_process():
+        print(*args, **kwargs)
+
+def synchronize():
+    """Synchronize between all processes."""
+    if int(os.environ.get("WORLD_SIZE", 1)) > 1:
+        dist.barrier()
+
+def get_rank():
+    """Get rank of current process."""
+    return int(os.environ.get("RANK", 0))
+
+def get_world_size():
+    """Get total number of processes."""
+    return int(os.environ.get("WORLD_SIZE", 1))
 
 @torch.no_grad()
 def initialize_slicefixer(model_path=None, sd_turbo_path=None, use_fp16=False):
@@ -182,8 +229,15 @@ def training(
     model_path,  # slicefixer_path
     organ_type,
     sd_turbo_path,
+    train_batch_size=1,
 ):
     first_iter = 0
+    rank = get_rank()
+    world_size = get_world_size()
+    
+    if is_main_process():
+        print(f"Distributed Training: Rank={rank}, World_Size={world_size}, Batch_Size={train_batch_size}")
+
 
 
     # Set up dataset
@@ -267,8 +321,12 @@ def training(
     ckpt_save_path = osp.join(scene.model_path, "ckpt")
     os.makedirs(ckpt_save_path, exist_ok=True)
     viewpoint_stack = None
-    progress_bar = tqdm(range(0, opt.iterations), desc="Train", leave=False)
-    progress_bar.update(first_iter)
+    
+    if is_main_process():
+        progress_bar = tqdm(range(0, opt.iterations), desc="Train", leave=False)
+        progress_bar.update(first_iter)
+    else:
+        progress_bar = None
     first_iter += 1
 
     # 用于存储增强后的体积数据
@@ -280,33 +338,55 @@ def training(
         # Update learning rate
         gaussians.update_learning_rate(iteration)
 
-        # Get one camera for training
+        # Get batch of cameras for training
         if not viewpoint_stack:
             viewpoint_stack = scene.getTrainCameras().copy()
-        viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack) - 1))
+        
+        # Sample batch of viewpoints
+        batch_size = min(train_batch_size, len(viewpoint_stack))
+        viewpoint_cams = []
+        for _ in range(batch_size):
+            if len(viewpoint_stack) == 0:
+                viewpoint_stack = scene.getTrainCameras().copy()
+            idx = randint(0, len(viewpoint_stack) - 1)
+            viewpoint_cams.append(viewpoint_stack.pop(idx))
 
-        # Render X-ray projection
-        render_pkg = render(viewpoint_cam, gaussians, pipe)
-        image, viewspace_point_tensor, visibility_filter, radii = (
-            render_pkg["render"],
-            render_pkg["viewspace_points"],
-            render_pkg["visibility_filter"],
-            render_pkg["radii"],
-        )
-
-        # Compute loss
-        gt_image = viewpoint_cam.original_image.cuda()
+        # Render X-ray projections and compute loss
         loss = {"total": 0.0}
-        render_loss = l1_loss(image, gt_image)
-        loss["render"] = render_loss
-        loss["total"] += loss["render"]
-        if opt.lambda_dssim > 0:
-            if FUSED_SSIM_AVAILABLE:
-                loss_dssim = 1.0 - fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
-            else:
-                loss_dssim = 1.0 - ssim(image, gt_image)
-            loss["dssim"] = loss_dssim
-            loss["total"] = loss["total"] + opt.lambda_dssim * loss_dssim
+        last_viewspace_point_tensor = None
+        last_visibility_filter = None
+        
+        for viewpoint_cam in viewpoint_cams:
+            # Render X-ray projection
+            render_pkg = render(viewpoint_cam, gaussians, pipe)
+            image, viewspace_point_tensor, visibility_filter, radii = (
+                render_pkg["render"],
+                render_pkg["viewspace_points"],
+                render_pkg["visibility_filter"],
+                render_pkg["radii"],
+            )
+
+            # Compute loss
+            gt_image = viewpoint_cam.original_image.cuda()
+            render_loss = l1_loss(image, gt_image)
+            loss["render"] = loss.get("render", 0.0) + render_loss / batch_size
+            loss["total"] += render_loss / batch_size
+            
+            if opt.lambda_dssim > 0:
+                if FUSED_SSIM_AVAILABLE:
+                    loss_dssim = 1.0 - fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
+                else:
+                    loss_dssim = 1.0 - ssim(image, gt_image)
+                loss["dssim"] = loss.get("dssim", 0.0) + loss_dssim / batch_size
+                loss["total"] = loss["total"] + opt.lambda_dssim * loss_dssim / batch_size
+            
+            # Store visibility stats (will accumulate max_radii2D in no_grad block)
+            gaussians.max_radii2D[visibility_filter] = torch.max(
+                gaussians.max_radii2D[visibility_filter], radii[visibility_filter]
+            )
+            # Save the last viewspace tensor and visibility filter for densification stats
+            last_viewspace_point_tensor = viewspace_point_tensor
+            last_visibility_filter = visibility_filter
         
          # 3D TV loss
         if use_tv:
@@ -460,10 +540,8 @@ def training(
 
         with torch.no_grad():
             # Adaptive control
-            gaussians.max_radii2D[visibility_filter] = torch.max(
-                gaussians.max_radii2D[visibility_filter], radii[visibility_filter]
-            )
-            gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
+            if last_viewspace_point_tensor is not None and last_visibility_filter is not None:
+                gaussians.add_densification_stats(last_viewspace_point_tensor, last_visibility_filter)
             if iteration < opt.densify_until_iter:
                 if (
                     iteration > opt.densify_from_iter
@@ -502,16 +580,18 @@ def training(
                 )
 
             # Progress bar
-            if iteration % 10 == 0:
-                progress_bar.set_postfix(
-                    {
-                        "loss": f"{loss['total'].item():.1e}",
-                        "pts": f"{gaussians.get_density.shape[0]:2.1e}",
-                    }
-                )
-                progress_bar.update(10)
-            if iteration == opt.iterations:
-                progress_bar.close()
+            if iteration % 10 == 0 and is_main_process():
+                if progress_bar is not None:
+                    progress_bar.set_postfix(
+                        {
+                            "loss": f"{loss['total'].item():.1e}",
+                            "pts": f"{gaussians.get_density.shape[0]:2.1e}",
+                        }
+                    )
+                    progress_bar.update(10)
+            if iteration == opt.iterations and is_main_process():
+                if progress_bar is not None:
+                    progress_bar.close()
 
             # Logging
             metrics = {}
@@ -690,6 +770,7 @@ if __name__ == "__main__":
     parser.add_argument("--config", type=str, default=None)
     parser.add_argument("--slicefixer_model_path", type=str, default=None, help="Path to trained SliceFixer model")
     parser.add_argument("--organ_type", type=str, default="Chest")
+    parser.add_argument("--train_batch_size", type=int, default=1, help="Batch size for training (number of viewpoints per iteration)")
     parser.add_argument(
         "--sd_turbo_path",
         type=str,
@@ -697,27 +778,32 @@ if __name__ == "__main__":
         help="Path or HF model id for SD-Turbo (fallback: env SD_TURBO_PATH, then stabilityai/sd-turbo)",
     )
 
-    args = parser.parse_args(sys.argv[1:])
+    # Use parse_known_args to handle torch.distributed.launch's --local-rank parameter
+    args, unknown_args = parser.parse_known_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     args.test_iterations.append(args.iterations)
     args.test_iterations.append(1)
     # fmt: on
 
+    # Initialize distributed training
+    rank, world_size, gpu = init_distributed_mode()
+    
     # Initialize system state (RNG)
     safe_state(args.quiet)
 
     # Load configuration files
     args_dict = vars(args)
     if args.config is not None:
-        print(f"Loading configuration file from {args.config}")
+        print_rank0(f"Loading configuration file from {args.config}")
         cfg = load_config(args.config)
         for key in list(cfg.keys()):
             args_dict[key] = cfg[key]
 
-    # Set up logging writer
-    tb_writer = prepare_output_and_logger(args)
+    # Set up logging writer (only on rank 0)
+    tb_writer = prepare_output_and_logger(args) if is_main_process() else None
 
-    print("Optimizing " + args.slicefixer_model_path)
+    print_rank0("Optimizing " + str(args.slicefixer_model_path))
+    print_rank0(f"Distributed Training Mode: rank={rank}, world_size={world_size}, gpu={gpu}, batch_size={args.train_batch_size}")
 
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
     training(
@@ -732,7 +818,12 @@ if __name__ == "__main__":
         args.slicefixer_model_path,
         args.organ_type,
         args.sd_turbo_path,
+        train_batch_size=args.train_batch_size,
     )
+    
+    # Clean up distributed training
+    if world_size > 1:
+        dist.destroy_process_group()
 
     # All done
-    print("Training complete.")
+    print_rank0("Training complete.")

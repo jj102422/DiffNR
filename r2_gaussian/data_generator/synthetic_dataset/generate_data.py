@@ -36,6 +36,13 @@ def load_mha_volume(mha_path):
     image = sitk.ReadImage(mha_path)
     volume_zyx = sitk.GetArrayFromImage(image).astype(np.float32)
     volume_xyz = np.transpose(volume_zyx, (2, 1, 0))
+    
+    # Normalize CT volume: clip at 0, normalize by fixed range 3000
+    # Following the pattern from process_dcm: clip(0, 3000) → [0, 3000] range → normalize to [0, 1]
+    volume_xyz = np.clip(volume_xyz, 0.0, None)  # Clip left at 0, no right bound
+    volume_xyz = volume_xyz / 3000.0  # Fixed normalization range: 3000
+    volume_xyz = np.clip(volume_xyz, 0.0, 1.0)  # Ensure [0, 1] range
+    
     return volume_xyz
 
 

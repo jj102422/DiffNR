@@ -86,6 +86,7 @@ class Scene:
         if queryfunc is not None:
             vol_pred = queryfunc(self.gaussians)["vol"]
             vol_gt = self.vol_gt
+            
             np.save(osp.join(point_cloud_path, "vol_gt.npy"), t2a(vol_gt))
             np.save(
                 osp.join(point_cloud_path, "vol_pred.npy"),

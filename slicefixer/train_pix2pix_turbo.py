@@ -1,6 +1,7 @@
 import os
 import json
 import gc
+import sys
 import lpips
 import clip
 import numpy as np
@@ -20,25 +21,7 @@ from diffusers.optimization import get_scheduler
 
 import wandb
 from cleanfid.fid import get_folder_features, build_feature_extractor, fid_from_feats
-
-
-# 兼容旧版/第三方依赖里未显式传 `indexing` 的 torch.meshgrid 调用，
-# 统一默认补成 `indexing="ij"`，避免 PyTorch 未来版本的警告。
-_orig_torch_meshgrid = torch.meshgrid
-
-
-def meshgrid_with_default_indexing(*tensors, indexing=None):
-    if len(tensors) == 1 and isinstance(tensors[0], (list, tuple)):
-        tensors = tuple(tensors[0])
-    if indexing is None:
-        indexing = "ij"
-    return _orig_torch_meshgrid(*tensors, indexing=indexing)
-
-
-torch.meshgrid = meshgrid_with_default_indexing
-
 # from pix2pix_turbo import Pix2Pix_Turbo
-import sys
 sys.path.append("./slicefixer") # 确保能索引到 DiffNR 里的 slicefixer 模块
 from SliceFixer import SliceFixer
 from my_utils.training_utils import parse_args_paired_training
@@ -52,10 +35,32 @@ except Exception:
 
 
 def normalize_to_255(img):
-    # wandb.Image 期望输入图像在 [0, 255] 范围内；这里把训练/验证时的
-    # 归一化图像从 [-1, 1] 转回可视化范围，避免 wandb 的范围警告。
+    # CT 切片不是天然落在 [-1, 1]；这里改成鲁棒的分位数窗宽/窗位归一化，
+    # 避免把 0 值背景错误映射成中灰，同时也能压制极端值的影响。
+    # 特别处理：对于有大量零值背景（如 GT volume）的情况，只对非零值进行分位数统计
     img = img.detach().cpu().float()
-    img = (img + 1.0) * 127.5
+    if img.numel() == 0:
+        return torch.zeros_like(img, dtype=torch.uint8)
+    
+    # 分离零值和非零值
+    non_zero_mask = img != 0
+    if non_zero_mask.sum() > 0:
+        # 如果有非零值，对非零值进行分位数统计
+        non_zero_vals = img[non_zero_mask]
+        lo = torch.quantile(non_zero_vals, 0.01)
+        hi = torch.quantile(non_zero_vals, 0.99)
+    else:
+        # 如果全是零，直接返回黑图
+        return torch.zeros_like(img, dtype=torch.uint8)
+    
+    if torch.isclose(hi, lo):
+        lo = non_zero_vals.min()
+        hi = non_zero_vals.max()
+    if torch.isclose(hi, lo):
+        return torch.zeros_like(img, dtype=torch.uint8)
+    
+    img = img.clamp(lo, hi)
+    img = (img - lo) / (hi - lo + 1e-8) * 255.0
     return img.clamp(0, 255).to(torch.uint8)
 
 
@@ -102,7 +107,9 @@ class MedicalCTDataset(torch.utils.data.Dataset):
             if coarse_vol.shape != gt_vol.shape:
                 continue
             self._vol_cache[case_path] = (coarse_vol, gt_vol)
-            for slice_idx in range(coarse_vol.shape[0]):
+            # 这里的 volume_gt.npy / vol_pred.npy 已经在数据生成阶段转成 XYZ 顺序，
+            # 因此 axis 2 才是 axial 方向；索引范围也要跟着改成 shape[2]。
+            for slice_idx in range(coarse_vol.shape[2]):
                 self.index_map.append((case_path, slice_idx))
 
     def __len__(self):
@@ -111,12 +118,13 @@ class MedicalCTDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         case_path, slice_idx = self.index_map[idx]
         coarse_vol, gt_vol = self._vol_cache[case_path]
-        coarse_slice = coarse_vol[slice_idx]
-        gt_slice = gt_vol[slice_idx]
+        # axial slice：axis 2 对应 Z 方向，因此这里沿最后一个维度取切片。
+        coarse_slice = coarse_vol[:, :, slice_idx]
+        gt_slice = gt_vol[:, :, slice_idx]
 
         # 这里需要 copy 一份，避免 mmap 读出的只读 numpy 数组直接转 tensor 时触发警告。
         coarse_tensor = torch.from_numpy(coarse_slice.copy()).float().unsqueeze(0)
-        gt_tensor = torch.from_numpy(gt_slice).float().unsqueeze(0)
+        gt_tensor = torch.from_numpy(gt_slice.copy()).float().unsqueeze(0)
 
         coarse_tensor = coarse_tensor.repeat(3, 1, 1)
         gt_tensor = gt_tensor.repeat(3, 1, 1)

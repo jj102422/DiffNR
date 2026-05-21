@@ -1,0 +1,2 @@
+case_name,vol_pred_path,shape,dtype,min,max,mean,std,sample_count
+1.3.6.1.4.1.9328.50.4.0001,/home/public/CTSpine1K/data/data-MHD_ctpro_woMask1/1.3.6.1.4.1.9328.50.4.0001/vol_pred.npy,"(512, 512, 512)",float32,0.0,6.660312175750732,0.08874606341123581,0.12940947711467743,32768
