@@ -12,6 +12,7 @@
 import os
 import os.path as osp
 import torch
+import torch.nn.functional as F
 import torch.distributed as dist
 import sys
 import numpy as np
@@ -19,6 +20,7 @@ import cv2
 import yaml
 import einops
 import random
+from datetime import timedelta
 from torch import nn
 from tqdm import tqdm
 from argparse import ArgumentParser
@@ -42,6 +44,7 @@ from r2_gaussian.utils.image_utils import metric_vol, metric_proj
 from r2_gaussian.utils.plot_utils import show_two_slice
 
 from slicefixer.SliceFixer import SliceFixer
+from slicefixer.intensity_utils import volume_to_slicefixer, slicefixer_to_volume
 
 try:
     from fused_ssim import fused_ssim
@@ -69,7 +72,7 @@ def init_distributed_mode():
             init_method="env://",
             rank=rank,
             world_size=world_size,
-            timeout=torch.distributed.timedelta(minutes=30)
+            timeout=timedelta(minutes=30)
         )
     
     return rank, world_size, gpu
@@ -118,58 +121,26 @@ def initialize_slicefixer(model_path=None, sd_turbo_path=None, use_fp16=False):
 @torch.no_grad()
 def enhance_slice_with_slicefixer(slicefixer, slice_data, prompt, xray_feat1, xray_feat2, use_fp16=False):
     try:
-        slice_image = slice_data.detach().cpu().numpy().squeeze()
-        slice_image = np.clip(slice_image, 0.0, 1.0)
-
-        if slice_image.max() > slice_image.min():
-            slice_normalized = (slice_image - slice_image.min()) / (slice_image.max() - slice_image.min())
-        else:
-            slice_normalized = slice_image
-
-        slice_uint8 = (slice_normalized * 255).astype(np.uint8)
-
-        # 转为 3 通道 RGB
-        if len(slice_uint8.shape) == 2:
-            slice_rgb = np.stack([slice_uint8] * 3, axis=-1)
-        else:
-            slice_rgb = slice_uint8
-
-        slice_pil = Image.fromarray(slice_rgb)
-
-        # ✅ 统一处理（resize 到 512 + center crop）
-        transform_input = transforms.Compose([
-            transforms.Resize(512, interpolation=transforms.InterpolationMode.LANCZOS),
-            transforms.CenterCrop(512),
-        ])
-        slice_pil = transform_input(slice_pil)
-
-        c_t = TF.to_tensor(slice_pil).unsqueeze(0).cuda()
+        original_hw = slice_data.shape[-2:]
+        slice_v = torch.clamp_min(slice_data.float().cuda().unsqueeze(0), 0.0)
+        slice_v = F.interpolate(slice_v, size=(512, 512), mode="bilinear", align_corners=False)
+        c_t = volume_to_slicefixer(slice_v).repeat(1, 3, 1, 1)
         if use_fp16:
             c_t = c_t.half()
 
-        output_image = slicefixer(
+        output_s = slicefixer(
             c_t, 
             prompt=prompt, 
             xray_feat1=xray_feat1, 
             xray_feat2=xray_feat2
         )
-        output_tensor = output_image * 0.5 + 0.5  # [-1,1] → [0,1]
-
-        # ✅ Downsample output to 256x256
-        downsample = transforms.Resize(256, interpolation=transforms.InterpolationMode.LANCZOS)
-        output_pil = transforms.ToPILImage()(output_tensor[0].cpu())
-        output_pil = downsample(output_pil)
-        output_tensor_resized = TF.to_tensor(output_pil).unsqueeze(0).cuda()
-
-        if output_tensor_resized.shape[1] == 3:
-            output_tensor_resized = torch.mean(output_tensor_resized, dim=1, keepdim=True)
-        #print(f"[DEBUG] Generated slice: min={output_tensor_resized.min().item():.4f}, max={output_tensor_resized.max().item():.4f}")
-
-        return output_tensor_resized
+        output_v = slicefixer_to_volume(output_s)
+        output_v = torch.mean(output_v, dim=1, keepdim=True)
+        return F.interpolate(output_v, size=original_hw, mode="bilinear", align_corners=False)
 
     except Exception as e:
         print(f"Error in SliceFixer enhancement: {e}")
-        return slice_data.unsqueeze(0).unsqueeze(0)
+        return torch.clamp_min(slice_data.float().cuda().unsqueeze(0), 0.0)
 
 
 # Extract slices from predicted CT volume during training
@@ -177,7 +148,6 @@ def extract_slices(vol_pred):
     #print(f"Volume shape: {vol_pred.shape}")
     #print(f"Global min: {vol_pred.min().item():.4f}, max: {vol_pred.max().item():.4f}")
     #print(f"Mean: {vol_pred.mean().item():.4f}, std: {vol_pred.std().item():.4f}")
-    vol_pred = torch.clamp(vol_pred, max=1.0)
     slices = [vol_pred[..., i][None] for i in range(vol_pred.shape[2])]
     # Optionally, print per-slice statistics
     #for i, s in enumerate(slices):
@@ -306,8 +276,13 @@ def training(
         xray_feat_path2 = os.path.join(dataset.source_path, f"{case_id}_xray_2.pt")
         xray_feat1 = torch.load(xray_feat_path1)
         xray_feat2 = torch.load(xray_feat_path2)
-        xray_feat1 = xray_feat1.unsqueeze(1)
-        xray_feat2 = xray_feat2.unsqueeze(1)
+        if tuple(xray_feat1.shape) != (1, 768) or tuple(xray_feat2.shape) != (1, 768):
+            raise ValueError(
+                f"Expected RAD-DINO CLS features [1, 768] for {case_id}; "
+                f"got {tuple(xray_feat1.shape)} and {tuple(xray_feat2.shape)}."
+            )
+        xray_feat1 = xray_feat1.float().unsqueeze(1).cuda()
+        xray_feat2 = xray_feat2.float().unsqueeze(1).cuda()
         print(f"load xray_feat1 from {xray_feat_path1}, shape: {xray_feat1.shape}")
         print(f"load xray_feat2 from {xray_feat_path2}, shape: {xray_feat2.shape}")
 

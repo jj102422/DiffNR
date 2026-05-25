@@ -13,6 +13,20 @@ sys.path.append(p)
 from model import make_1step_sched, my_vae_encoder_fwd, my_vae_decoder_fwd, CrossAttnFusionAdapter
 
 
+INTENSITY_DOMAIN = {
+    "stored_volume": "v = clip(HU, 0, None) / 3000",
+    "model_input": "s = 2 * v - 1",
+    "model_output_inverse": "v = (s + 1) / 2",
+    "upper_clipping": False,
+    "model_lower_bound": -1.0,
+}
+XRAY_CONDITIONING = {
+    "encoder": "microsoft/rad-dino",
+    "feature": "cls_embedding",
+    "per_view_shape": [1, 768],
+}
+
+
 class TwinConv(torch.nn.Module):
     def __init__(self, convin_pretrained, convin_curr):
         super(TwinConv, self).__init__()
@@ -149,6 +163,15 @@ class SliceFixer(torch.nn.Module):
 
         elif pretrained_path is not None:
             sd = torch.load(pretrained_path, map_location="cpu")
+            if "state_dict_fusion_adapter" not in sd:
+                raise ValueError(
+                    "SliceFixer checkpoint does not contain RAD-DINO fusion adapter weights. "
+                    "Retrain with the high-HU/RAD-DINO conditioning pipeline."
+                )
+            if sd.get("intensity_domain") != INTENSITY_DOMAIN:
+                raise ValueError("SliceFixer checkpoint intensity domain is incompatible with this pipeline.")
+            if sd.get("xray_conditioning") != XRAY_CONDITIONING:
+                raise ValueError("SliceFixer checkpoint X-ray conditioning metadata is incompatible.")
             unet_lora_config = LoraConfig(r=sd["rank_unet"], init_lora_weights="gaussian", target_modules=sd["unet_lora_target_modules"])
             vae_lora_config = LoraConfig(r=sd["rank_vae"], init_lora_weights="gaussian", target_modules=sd["vae_lora_target_modules"])
             vae.add_adapter(vae_lora_config, adapter_name="vae_skip")
@@ -161,6 +184,11 @@ class SliceFixer(torch.nn.Module):
             for k in sd["state_dict_unet"]:
                 _sd_unet[k] = sd["state_dict_unet"][k]
             unet.load_state_dict(_sd_unet)
+            self.fusion_adapter.load_state_dict(sd["state_dict_fusion_adapter"])
+            self.lora_rank_unet = sd["rank_unet"]
+            self.lora_rank_vae = sd["rank_vae"]
+            self.target_modules_vae = sd["vae_lora_target_modules"]
+            self.target_modules_unet = sd["unet_lora_target_modules"]
 
         elif pretrained_name is None and pretrained_path is None:
             print("Initializing model with random weights")
@@ -244,7 +272,7 @@ class SliceFixer(torch.nn.Module):
             x_denoised = self.sched.step(model_pred, self.timesteps, encoded_control, return_dict=True).prev_sample
             x_denoised = x_denoised.to(model_pred.dtype)
             self.vae.decoder.incoming_skip_acts = self.vae.encoder.current_down_blocks
-            output_image = (self.vae.decode(x_denoised / self.vae.config.scaling_factor).sample).clamp(-1, 1)
+            output_image = self.vae.decode(x_denoised / self.vae.config.scaling_factor).sample.clamp_min(-1.0)
         else:
             # scale the lora weights based on the r value
             self.unet.set_adapters(["default"], weights=[r])
@@ -259,7 +287,7 @@ class SliceFixer(torch.nn.Module):
             x_denoised = x_denoised.to(unet_output.dtype)
             self.vae.decoder.incoming_skip_acts = self.vae.encoder.current_down_blocks
             self.vae.decoder.gamma = r
-            output_image = (self.vae.decode(x_denoised / self.vae.config.scaling_factor).sample).clamp(-1, 1)
+            output_image = self.vae.decode(x_denoised / self.vae.config.scaling_factor).sample.clamp_min(-1.0)
         return output_image
 
     def save_model(self, outf):
@@ -270,4 +298,7 @@ class SliceFixer(torch.nn.Module):
         sd["rank_vae"] = self.lora_rank_vae
         sd["state_dict_unet"] = {k: v for k, v in self.unet.state_dict().items() if "lora" in k or "conv_in" in k}
         sd["state_dict_vae"] = {k: v for k, v in self.vae.state_dict().items() if "lora" in k or "skip" in k}
+        sd["state_dict_fusion_adapter"] = self.fusion_adapter.state_dict()
+        sd["intensity_domain"] = INTENSITY_DOMAIN
+        sd["xray_conditioning"] = XRAY_CONDITIONING
         torch.save(sd, outf)

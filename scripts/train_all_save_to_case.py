@@ -2,10 +2,12 @@
 
 import argparse
 import glob
+import numpy as np
 import os
 import os.path as osp
 import shutil
 import subprocess
+from pathlib import Path
 
 
 def find_latest_iteration(point_cloud_dir: str) -> str:
@@ -52,10 +54,10 @@ def main(args):
         case_output_path = osp.join(output_root, case_name)
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = str(device)
-        existing_pickle = osp.join(case_path, "point_cloud.pickle")
-        existing_vol_pred = osp.join(case_path, "vol_pred.npy")
-        if skip_existing and osp.exists(existing_pickle) and osp.exists(existing_vol_pred):
-            print(f"Skip {case_name}: outputs already exist.")
+        existing_vol_pred_npy = Path(case_path) / "vol_pred.npy"
+        existing_vol_pred_npz = Path(case_path) / "vol_pred.npz"
+        if skip_existing and (existing_vol_pred_npy.exists() or existing_vol_pred_npz.exists()):
+            print(f"Skip {case_name}: vol_pred already exists.")
             continue
 
         init_path = osp.join(case_path, f"init_{case_name}.npy")
@@ -117,18 +119,19 @@ def main(args):
         point_cloud_dir = osp.join(case_output_path, "point_cloud")
         latest_iter_dir = find_latest_iteration(point_cloud_dir)
 
-        src_pickle = osp.join(latest_iter_dir, "point_cloud.pickle")
         src_vol_pred = osp.join(latest_iter_dir, "vol_pred.npy")
-        if not osp.exists(src_pickle) or not osp.exists(src_vol_pred):
-            raise FileNotFoundError(
-                f"Missing outputs in {latest_iter_dir}: point_cloud.pickle / vol_pred.npy"
-            )
+        if not osp.exists(src_vol_pred):
+            raise FileNotFoundError(f"Missing vol_pred.npy in {latest_iter_dir}")
 
-        dst_pickle = osp.join(case_path, "point_cloud.pickle")
-        dst_vol_pred = osp.join(case_path, "vol_pred.npy")
-        shutil.copy2(src_pickle, dst_pickle)
-        shutil.copy2(src_vol_pred, dst_vol_pred)
-        print(f"Saved outputs to {case_path}")
+        dst_vol_pred = Path(case_path) / "vol_pred.npz"
+        vol_pred = np.load(src_vol_pred, mmap_mode="r")
+        np.savez_compressed(dst_vol_pred, vol_pred=vol_pred)
+        stale_npy = Path(case_path) / "vol_pred.npy"
+        if stale_npy.exists():
+            stale_npy.unlink()
+        if Path(init_path).exists():
+            Path(init_path).unlink()
+        print(f"Saved compressed vol_pred to {dst_vol_pred}")
 
         if not keep_output:
             shutil.rmtree(case_output_path, ignore_errors=True)

@@ -34,33 +34,24 @@ def test_batch_size(dataset_path, batch_size, num_iterations=50):
     torch.cuda.reset_peak_memory_stats()
     
     try:
-        # Setup dataset with all required attributes
-        class DummyDataset:
-            def __init__(self, source_path):
-                self.source_path = source_path
-                self.model_path = None
-                self.scale_min = -1.0
-                self.scale_max = -1.0
-                self.sh_degree = 3
-                self.white_background = False
-                self.random_background = False
-                self.eval = False
-                self.data_device = "cuda"
-                self.images_per_gpu_ema = 0
-        
-        dataset = DummyDataset(dataset_path)
+        # Build the same default parameter objects as train_DiffNR.py, then
+        # override only the source path. This keeps the benchmark aligned with
+        # new ModelParams/OptimizationParams fields.
+        param_parser = argparse.ArgumentParser()
+        model_params = ModelParams(param_parser)
+        opt_params = OptimizationParams(param_parser)
+        pipe_params = PipelineParams(param_parser)
+        defaults = param_parser.parse_args(["-s", dataset_path])
+        dataset = model_params.extract(defaults)
         scene = Scene(dataset, shuffle=False)
         
         # Setup Gaussians
         gaussians = GaussianModel(None)
         initialize_gaussian(gaussians, dataset, None)
         
-        # Setup optimizer (simple version)
-        opt_params = OptimizationParams(argparse.Namespace())
-        gaussians.training_setup(opt_params)
-        
-        # Setup rendering params
-        pipe_params = PipelineParams(argparse.Namespace())
+        # Setup optimizer and rendering params with train_DiffNR defaults.
+        gaussians.training_setup(opt_params.extract(defaults))
+        pipe_params = pipe_params.extract(defaults)
         
         # Get query function
         scanner_cfg = scene.scanner_cfg
@@ -120,6 +111,8 @@ def test_batch_size(dataset_path, batch_size, num_iterations=50):
                       f"Time={iter_time:.3f}s (avg={avg_time:.3f}s), "
                       f"Memory={current_memory:.2f}GB (peak={peak_memory:.2f}GB)")
         
+        peak_memory = max(peak_memory, torch.cuda.max_memory_allocated() / 1024**3)
+
         # Clean up
         del scene, gaussians
         torch.cuda.empty_cache()

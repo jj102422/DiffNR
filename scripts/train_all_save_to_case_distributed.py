@@ -3,11 +3,13 @@
 
 import argparse
 import glob
+import numpy as np
 import os
 import os.path as osp
 import shutil
 import subprocess
 import torch
+from pathlib import Path
 
 
 def find_latest_iteration(point_cloud_dir: str) -> str:
@@ -52,6 +54,7 @@ def main(args):
     train_batch_size = args.train_batch_size
     start_idx = args.start_idx
     end_idx = args.end_idx
+    no_slicefixer = args.no_slicefixer
 
     case_paths = sorted(glob.glob(osp.join(source_path, "*")))
     if len(case_paths) == 0:
@@ -66,10 +69,10 @@ def main(args):
         case_name = osp.basename(case_path)
         case_output_path = osp.join(output_root, case_name)
         
-        existing_pickle = osp.join(case_path, "point_cloud.pickle")
-        existing_vol_pred = osp.join(case_path, "vol_pred.npy")
-        if skip_existing and osp.exists(existing_pickle) and osp.exists(existing_vol_pred):
-            print(f"[{case_idx+1}/{len(case_paths)}] Skip {case_name}: outputs already exist.")
+        existing_vol_pred_npy = Path(case_path) / "vol_pred.npy"
+        existing_vol_pred_npz = Path(case_path) / "vol_pred.npz"
+        if skip_existing and (existing_vol_pred_npy.exists() or existing_vol_pred_npz.exists()):
+            print(f"[{case_idx+1}/{len(case_paths)}] Skip {case_name}: vol_pred already exists.")
             continue
 
         # Handle initialization if needed
@@ -107,7 +110,19 @@ def main(args):
                 str(init_random_density_max),
             ]
             print(f"[{case_idx+1}/{len(case_paths)}] Rebuilding init for {case_name} ...")
-            subprocess.run(init_cmd, check=True)
+            try:
+                subprocess.run(init_cmd, check=True)
+            except subprocess.CalledProcessError as e:
+                print(f"  ERROR: init rebuild failed for {case_name}: {e}")
+                # write error file into case folder for debugging
+                try:
+                    os.makedirs(case_output_path, exist_ok=True)
+                    with open(osp.join(case_output_path, "error_init.txt"), "w") as f:
+                        f.write(str(e))
+                except Exception:
+                    pass
+                # skip this case
+                continue
 
         # Prepare training command
         if use_torchrun:
@@ -122,7 +137,6 @@ def main(args):
                 "train_DiffNR.py",
                 "-s", case_path,
                 "-m", case_output_path,
-                "--slicefixer_model_path", ckpt_path,
                 "--organ_type", organ_type,
                 "--sd_turbo_path", sd_turbo_path,
                 "--train_batch_size", str(train_batch_size),
@@ -134,11 +148,19 @@ def main(args):
                 "train_DiffNR.py",
                 "-s", case_path,
                 "-m", case_output_path,
-                "--slicefixer_model_path", ckpt_path,
                 "--organ_type", organ_type,
                 "--sd_turbo_path", sd_turbo_path,
                 "--train_batch_size", str(train_batch_size),
             ]
+
+        if no_slicefixer:
+            # Force-disable diffusion branch so SliceFixer is not used.
+            cmd += [
+                "--lambda_diffusion_ssim", "0",
+                "--lambda_diffusion_l1", "0",
+            ]
+        elif ckpt_path:
+            cmd += ["--slicefixer_model_path", ckpt_path]
         
         if config_path:
             cmd += ["--config", config_path]
@@ -146,23 +168,37 @@ def main(args):
         print(f"[{case_idx+1}/{len(case_paths)}] Training {case_name} ...")
         if use_torchrun:
             print(f"  Using torchrun: nproc_per_node={nproc_per_node}, batch_size={train_batch_size}")
-        subprocess.run(cmd, check=True)
+        try:
+            subprocess.run(cmd, check=True)
+        except subprocess.CalledProcessError as e:
+            print(f"  ERROR: training failed for {case_name}: {e}")
+            # Save command and error to case output for inspection
+            try:
+                os.makedirs(case_output_path, exist_ok=True)
+                with open(osp.join(case_output_path, "error_train.txt"), "w") as f:
+                    f.write("command: " + " ".join(cmd) + "\n")
+                    f.write(str(e))
+            except Exception:
+                pass
+            # continue to next case instead of aborting the whole worker
+            continue
 
         point_cloud_dir = osp.join(case_output_path, "point_cloud")
         latest_iter_dir = find_latest_iteration(point_cloud_dir)
 
-        src_pickle = osp.join(latest_iter_dir, "point_cloud.pickle")
         src_vol_pred = osp.join(latest_iter_dir, "vol_pred.npy")
-        if not osp.exists(src_pickle) or not osp.exists(src_vol_pred):
-            raise FileNotFoundError(
-                f"Missing outputs in {latest_iter_dir}: point_cloud.pickle / vol_pred.npy"
-            )
+        if not osp.exists(src_vol_pred):
+            raise FileNotFoundError(f"Missing vol_pred.npy in {latest_iter_dir}")
 
-        dst_pickle = osp.join(case_path, "point_cloud.pickle")
-        dst_vol_pred = osp.join(case_path, "vol_pred.npy")
-        shutil.copy2(src_pickle, dst_pickle)
-        shutil.copy2(src_vol_pred, dst_vol_pred)
-        print(f"  Saved outputs to {case_path}")
+        dst_vol_pred = Path(case_path) / "vol_pred.npz"
+        vol_pred = np.load(src_vol_pred, mmap_mode="r")
+        np.savez_compressed(dst_vol_pred, vol_pred=vol_pred)
+        stale_npy = Path(case_path) / "vol_pred.npy"
+        if stale_npy.exists():
+            stale_npy.unlink()
+        if Path(init_path).exists():
+            Path(init_path).unlink()
+        print(f"  Saved compressed vol_pred to {dst_vol_pred}")
 
         if not keep_output:
             shutil.rmtree(case_output_path, ignore_errors=True)
@@ -195,6 +231,11 @@ if __name__ == "__main__":
         type=int, 
         default=1,
         help="Batch size for training (number of viewpoints per iteration)"
+    )
+    parser.add_argument(
+        "--no_slicefixer",
+        action="store_true",
+        help="Disable SliceFixer/diffusion enhancement (force lambda_diffusion_* to 0).",
     )
     parser.add_argument(
         "--keep_output",

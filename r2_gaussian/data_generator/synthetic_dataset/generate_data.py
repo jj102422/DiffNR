@@ -41,7 +41,7 @@ def load_mha_volume(mha_path):
     # Following the pattern from process_dcm: clip(0, 3000) → [0, 3000] range → normalize to [0, 1]
     volume_xyz = np.clip(volume_xyz, 0.0, None)  # Clip left at 0, no right bound
     volume_xyz = volume_xyz / 3000.0  # Fixed normalization range: 3000
-    volume_xyz = np.clip(volume_xyz, 0.0, 1.0)  # Ensure [0, 1] range
+    # volume_xyz = np.clip(volume_xyz, 0.0, 1.0)  # Ensure [0, 1] range
     
     return volume_xyz
 
@@ -133,11 +133,11 @@ def save_case(case_save_path, case_name, vol, projs, angles_rad, scanner_cfg):
 
     torch.save(
         torch.from_numpy(projs[0]).float(),
-        osp.join(case_save_path, f"{case_name}_xray_1.pt"),
+        osp.join(case_save_path, f"{case_name}_xray_raw_1.pt"),
     )
     torch.save(
         torch.from_numpy(projs[1]).float(),
-        osp.join(case_save_path, f"{case_name}_xray_2.pt"),
+        osp.join(case_save_path, f"{case_name}_xray_raw_2.pt"),
     )
 
     meta = {

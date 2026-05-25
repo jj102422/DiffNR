@@ -10,6 +10,7 @@ torch
 torchvision
 diffusers
 transformers
+rad-dino
 peft
 accelerate
 requests

@@ -6,6 +6,7 @@ import os.path as osp
 import json
 import torch
 import pickle
+from pathlib import Path
 
 sys.path.append("./")
 from r2_gaussian.utils.graphics_utils import BasicPointCloud, fetchPly
@@ -14,6 +15,21 @@ mode_id = {
     "parallel": 0,
     "cone": 1,
 }
+
+
+
+
+def load_numpy_array(path):
+    path = Path(path)
+    if not path.exists() and path.suffix == ".npy":
+        npz_path = path.with_suffix(".npz")
+        if npz_path.exists():
+            path = npz_path
+    if path.suffix == ".npz":
+        with np.load(path) as data:
+            key = path.stem if path.stem in data.files else data.files[0]
+            return data[key]
+    return np.load(path)
 
 
 class CameraInfo(NamedTuple):
@@ -79,7 +95,7 @@ def readBlenderInfo(path, eval):
     train_cam_infos = cam_infos["train"]
     test_cam_infos = cam_infos["test"]
 
-    vol_gt = torch.from_numpy(np.load(meta_data["vol"])).float().cuda()
+    vol_gt = torch.from_numpy(load_numpy_array(meta_data["vol"])).float().cuda()
 
     scene_info = SceneInfo(
         train_cameras=train_cam_infos,

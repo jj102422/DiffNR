@@ -1,4 +1,6 @@
 import os
+from pathlib import Path
+import zipfile
 import json
 import gc
 import sys
@@ -24,6 +26,7 @@ from cleanfid.fid import get_folder_features, build_feature_extractor, fid_from_
 # from pix2pix_turbo import Pix2Pix_Turbo
 sys.path.append("./slicefixer") # 确保能索引到 DiffNR 里的 slicefixer 模块
 from SliceFixer import SliceFixer
+from intensity_utils import volume_to_slicefixer
 from my_utils.training_utils import parse_args_paired_training
 
 try:
@@ -35,15 +38,12 @@ except Exception:
 
 
 def normalize_to_255(img):
-    # CT 切片不是天然落在 [-1, 1]；这里改成鲁棒的分位数窗宽/窗位归一化，
-    # 避免把 0 值背景错误映射成中灰，同时也能压制极端值的影响。
-    # 特别处理：对于有大量零值背景（如 GT volume）的情况，只对非零值进行分位数统计
+    # Visualization only: model tensors are in s-domain, where background is -1.
     img = img.detach().cpu().float()
     if img.numel() == 0:
         return torch.zeros_like(img, dtype=torch.uint8)
     
-    # 分离零值和非零值
-    non_zero_mask = img != 0
+    non_zero_mask = img > -1.0 + 1e-6
     if non_zero_mask.sum() > 0:
         # 如果有非零值，对非零值进行分位数统计
         non_zero_vals = img[non_zero_mask]
@@ -77,6 +77,38 @@ def unique_parameters(params):
     return unique
 
 
+def _npz_key(path):
+    stem = Path(path).stem
+    with np.load(path) as data:
+        return stem if stem in data.files else data.files[0]
+
+
+def get_volume_info(path):
+    if path.endswith(".npz"):
+        key = _npz_key(path)
+        with zipfile.ZipFile(path) as zf, zf.open(f"{key}.npy") as handle:
+            version = np.lib.format.read_magic(handle)
+            shape, _, dtype = np.lib.format._read_array_header(
+                handle,
+                version,
+                max_header_size=10000,
+            )
+        return tuple(shape), dtype, key
+
+    arr = np.load(path, mmap_mode="r")
+    return arr.shape, arr.dtype, None
+
+
+def load_volume_slice(path, slice_idx, key=None):
+    if path.endswith(".npz"):
+        with np.load(path) as data:
+            array_key = key or (Path(path).stem if Path(path).stem in data.files else data.files[0])
+            return data[array_key][:, :, slice_idx]
+
+    arr = np.load(path, mmap_mode="r")
+    return arr[:, :, slice_idx]
+
+
 class MedicalCTDataset(torch.utils.data.Dataset):
     def __init__(self, case_paths, tokenizer, prompt):
         self.case_paths = case_paths
@@ -89,27 +121,52 @@ class MedicalCTDataset(torch.utils.data.Dataset):
             return_tensors="pt",
         ).input_ids[0]
         self.index_map = []
-        self._vol_cache = {}
+        self._volume_info = {}
 
         for case_path in self.case_paths:
-            coarse_path = os.path.join(case_path, "vol_pred.npy")
+            coarse_candidates = [
+                os.path.join(case_path, "vol_pred.npz"),
+                os.path.join(case_path, "vol_pred.npy"),
+            ]
+            coarse_path = next((p for p in coarse_candidates if os.path.exists(p)), None)
             gt_candidates = [
+                os.path.join(case_path, "volume_gt.npz"),
                 os.path.join(case_path, "volume_gt.npy"),
+                os.path.join(case_path, "vol_gt.npz"),
                 os.path.join(case_path, "vol_gt.npy"),
             ]
             gt_path = next((p for p in gt_candidates if os.path.exists(p)), None)
-            if not os.path.exists(coarse_path) or gt_path is None:
+            case_name = os.path.basename(case_path.rstrip(os.sep))
+            xray_path1 = os.path.join(case_path, f"{case_name}_xray_1.pt")
+            xray_path2 = os.path.join(case_path, f"{case_name}_xray_2.pt")
+            if coarse_path is None or gt_path is None or not os.path.exists(xray_path1) or not os.path.exists(xray_path2):
                 continue
-            coarse_vol = np.load(coarse_path, mmap_mode="r")
-            gt_vol = np.load(gt_path, mmap_mode="r")
-            if coarse_vol.ndim != 3 or gt_vol.ndim != 3:
+
+            coarse_shape, _, coarse_key = get_volume_info(coarse_path)
+            gt_shape, _, gt_key = get_volume_info(gt_path)
+            if len(coarse_shape) != 3 or len(gt_shape) != 3:
                 continue
-            if coarse_vol.shape != gt_vol.shape:
+            if coarse_shape != gt_shape:
                 continue
-            self._vol_cache[case_path] = (coarse_vol, gt_vol)
+            xray_feat1 = torch.load(xray_path1, map_location="cpu").float()
+            xray_feat2 = torch.load(xray_path2, map_location="cpu").float()
+            if tuple(xray_feat1.shape) != (1, 768) or tuple(xray_feat2.shape) != (1, 768):
+                raise ValueError(
+                    f"Expected RAD-DINO CLS features [1, 768] for {case_name}; "
+                    f"got {tuple(xray_feat1.shape)} and {tuple(xray_feat2.shape)}. "
+                    "Run scripts/extract_rad_dino_xray_features.py first."
+                )
+            self._volume_info[case_path] = {
+                "coarse_path": coarse_path,
+                "coarse_key": coarse_key,
+                "gt_path": gt_path,
+                "gt_key": gt_key,
+                "xray_feat1": xray_feat1,
+                "xray_feat2": xray_feat2,
+            }
             # 这里的 volume_gt.npy / vol_pred.npy 已经在数据生成阶段转成 XYZ 顺序，
             # 因此 axis 2 才是 axial 方向；索引范围也要跟着改成 shape[2]。
-            for slice_idx in range(coarse_vol.shape[2]):
+            for slice_idx in range(coarse_shape[2]):
                 self.index_map.append((case_path, slice_idx))
 
     def __len__(self):
@@ -117,21 +174,31 @@ class MedicalCTDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         case_path, slice_idx = self.index_map[idx]
-        coarse_vol, gt_vol = self._vol_cache[case_path]
+        volume_info = self._volume_info[case_path]
         # axial slice：axis 2 对应 Z 方向，因此这里沿最后一个维度取切片。
-        coarse_slice = coarse_vol[:, :, slice_idx]
-        gt_slice = gt_vol[:, :, slice_idx]
+        coarse_slice = load_volume_slice(
+            volume_info["coarse_path"],
+            slice_idx,
+            volume_info["coarse_key"],
+        )
+        gt_slice = load_volume_slice(
+            volume_info["gt_path"],
+            slice_idx,
+            volume_info["gt_key"],
+        )
 
         # 这里需要 copy 一份，避免 mmap 读出的只读 numpy 数组直接转 tensor 时触发警告。
-        coarse_tensor = torch.from_numpy(coarse_slice.copy()).float().unsqueeze(0)
-        gt_tensor = torch.from_numpy(gt_slice.copy()).float().unsqueeze(0)
+        coarse_v = torch.from_numpy(coarse_slice.copy()).float().unsqueeze(0)
+        gt_v = torch.from_numpy(gt_slice.copy()).float().unsqueeze(0)
 
-        coarse_tensor = coarse_tensor.repeat(3, 1, 1)
-        gt_tensor = gt_tensor.repeat(3, 1, 1)
+        coarse_tensor = volume_to_slicefixer(coarse_v).repeat(3, 1, 1)
+        gt_tensor = volume_to_slicefixer(gt_v).repeat(3, 1, 1)
 
         return {
             "conditioning_pixel_values": coarse_tensor,
             "output_pixel_values": gt_tensor,
+            "xray_feat1": volume_info["xray_feat1"],
+            "xray_feat2": volume_info["xray_feat2"],
             "caption": self.caption,
             "input_ids": self.input_ids,
         }
@@ -212,6 +279,7 @@ def main(args):
         list(net_pix2pix.vae.decoder.skip_conv_2.parameters()) + \
         list(net_pix2pix.vae.decoder.skip_conv_3.parameters()) + \
         list(net_pix2pix.vae.decoder.skip_conv_4.parameters())
+    layers_to_opt += list(net_pix2pix.fusion_adapter.parameters())
     # 防止 conv_in、skip_conv 或 LoRA 参数在不同收集路径中被重复加入。
     layers_to_opt = unique_parameters(layers_to_opt)
 
@@ -339,9 +407,17 @@ def main(args):
             with accelerator.accumulate(*l_acc):
                 x_src = batch["conditioning_pixel_values"].cuda()
                 x_tgt = batch["output_pixel_values"].cuda()
+                xray_feat1 = batch["xray_feat1"].cuda()
+                xray_feat2 = batch["xray_feat2"].cuda()
                 B, C, H, W = x_src.shape
                 # forward pass
-                x_tgt_pred = net_pix2pix(x_src, prompt_tokens=batch["input_ids"], deterministic=True)
+                x_tgt_pred = net_pix2pix(
+                    x_src,
+                    prompt_tokens=batch["input_ids"],
+                    xray_feat1=xray_feat1,
+                    xray_feat2=xray_feat2,
+                    deterministic=True,
+                )
                 # Reconstruction loss
                 loss_l2 = F.mse_loss(x_tgt_pred.float(), x_tgt.float(), reduction="mean") * args.lambda_l2
                 loss_lpips = net_lpips(x_tgt_pred.float(), x_tgt.float()).mean() * args.lambda_lpips
@@ -425,6 +501,13 @@ def main(args):
                     logs["lossD"] = lossD.detach().item()
                     logs["loss_l2"] = loss_l2.detach().item()
                     logs["loss_lpips"] = loss_lpips.detach().item()
+                    high_value_mask = x_tgt > 1.0
+                    if high_value_mask.any():
+                        high_value_error_v = (x_tgt_pred - x_tgt).abs()[high_value_mask] * 0.5
+                        logs["high_value_mae_v"] = high_value_error_v.mean().detach().item()
+                        logs["high_value_l2_v"] = (high_value_error_v ** 2).mean().detach().item()
+                    logs["pred_s_max"] = x_tgt_pred.max().detach().item()
+                    logs["target_s_max"] = x_tgt.max().detach().item()
                     if args.lambda_clipsim > 0:
                         logs["loss_clipsim"] = loss_clipsim.detach().item()
                     if args.lambda_ssim > 0:
@@ -459,11 +542,19 @@ def main(args):
                                 break
                             x_src = batch_val["conditioning_pixel_values"].cuda()
                             x_tgt = batch_val["output_pixel_values"].cuda()
+                            xray_feat1 = batch_val["xray_feat1"].cuda()
+                            xray_feat2 = batch_val["xray_feat2"].cuda()
                             B, C, H, W = x_src.shape
                             assert B == 1, "Use batch size 1 for eval."
                             with torch.no_grad():
                                 # forward pass
-                                x_tgt_pred = accelerator.unwrap_model(net_pix2pix)(x_src, prompt_tokens=batch_val["input_ids"].cuda(), deterministic=True)
+                                x_tgt_pred = accelerator.unwrap_model(net_pix2pix)(
+                                    x_src,
+                                    prompt_tokens=batch_val["input_ids"].cuda(),
+                                    xray_feat1=xray_feat1,
+                                    xray_feat2=xray_feat2,
+                                    deterministic=True,
+                                )
                                 # compute the reconstruction losses
                                 loss_l2 = F.mse_loss(x_tgt_pred.float(), x_tgt.float(), reduction="mean")
                                 loss_lpips = net_lpips(x_tgt_pred.float(), x_tgt.float()).mean()
@@ -501,6 +592,11 @@ def main(args):
                         gc.collect()
                         torch.cuda.empty_cache()
                     accelerator.log(logs, step=global_step)
+            if global_step >= args.max_train_steps:
+                break
+        if global_step >= args.max_train_steps:
+            break
+    accelerator.end_training()
 
 
 if __name__ == "__main__":
