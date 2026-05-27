@@ -110,9 +110,10 @@ def load_volume_slice(path, slice_idx, key=None):
 
 
 class MedicalCTDataset(torch.utils.data.Dataset):
-    def __init__(self, case_paths, tokenizer, prompt):
+    def __init__(self, case_paths, tokenizer, prompt, use_xray_conditioning=False):
         self.case_paths = case_paths
         self.caption = prompt
+        self.use_xray_conditioning = use_xray_conditioning
         self.input_ids = tokenizer(
             prompt,
             max_length=tokenizer.model_max_length,
@@ -137,9 +138,7 @@ class MedicalCTDataset(torch.utils.data.Dataset):
             ]
             gt_path = next((p for p in gt_candidates if os.path.exists(p)), None)
             case_name = os.path.basename(case_path.rstrip(os.sep))
-            xray_path1 = os.path.join(case_path, f"{case_name}_xray_1.pt")
-            xray_path2 = os.path.join(case_path, f"{case_name}_xray_2.pt")
-            if coarse_path is None or gt_path is None or not os.path.exists(xray_path1) or not os.path.exists(xray_path2):
+            if coarse_path is None or gt_path is None:
                 continue
 
             coarse_shape, _, coarse_key = get_volume_info(coarse_path)
@@ -148,22 +147,28 @@ class MedicalCTDataset(torch.utils.data.Dataset):
                 continue
             if coarse_shape != gt_shape:
                 continue
-            xray_feat1 = torch.load(xray_path1, map_location="cpu").float()
-            xray_feat2 = torch.load(xray_path2, map_location="cpu").float()
-            if tuple(xray_feat1.shape) != (1, 768) or tuple(xray_feat2.shape) != (1, 768):
-                raise ValueError(
-                    f"Expected RAD-DINO CLS features [1, 768] for {case_name}; "
-                    f"got {tuple(xray_feat1.shape)} and {tuple(xray_feat2.shape)}. "
-                    "Run scripts/extract_rad_dino_xray_features.py first."
-                )
-            self._volume_info[case_path] = {
+            volume_info = {
                 "coarse_path": coarse_path,
                 "coarse_key": coarse_key,
                 "gt_path": gt_path,
                 "gt_key": gt_key,
-                "xray_feat1": xray_feat1,
-                "xray_feat2": xray_feat2,
             }
+            if self.use_xray_conditioning:
+                xray_path1 = os.path.join(case_path, f"{case_name}_xray_1.pt")
+                xray_path2 = os.path.join(case_path, f"{case_name}_xray_2.pt")
+                if not os.path.exists(xray_path1) or not os.path.exists(xray_path2):
+                    continue
+                xray_feat1 = torch.load(xray_path1, map_location="cpu").float()
+                xray_feat2 = torch.load(xray_path2, map_location="cpu").float()
+                if tuple(xray_feat1.shape) != (1, 768) or tuple(xray_feat2.shape) != (1, 768):
+                    raise ValueError(
+                        f"Expected RAD-DINO CLS features [1, 768] for {case_name}; "
+                        f"got {tuple(xray_feat1.shape)} and {tuple(xray_feat2.shape)}. "
+                        "Run scripts/extract_rad_dino_xray_features.py first."
+                    )
+                volume_info["xray_feat1"] = xray_feat1
+                volume_info["xray_feat2"] = xray_feat2
+            self._volume_info[case_path] = volume_info
             # 这里的 volume_gt.npy / vol_pred.npy 已经在数据生成阶段转成 XYZ 顺序，
             # 因此 axis 2 才是 axial 方向；索引范围也要跟着改成 shape[2]。
             for slice_idx in range(coarse_shape[2]):
@@ -194,14 +199,20 @@ class MedicalCTDataset(torch.utils.data.Dataset):
         coarse_tensor = volume_to_slicefixer(coarse_v).repeat(3, 1, 1)
         gt_tensor = volume_to_slicefixer(gt_v).repeat(3, 1, 1)
 
-        return {
+        sample = {
             "conditioning_pixel_values": coarse_tensor,
             "output_pixel_values": gt_tensor,
-            "xray_feat1": volume_info["xray_feat1"],
-            "xray_feat2": volume_info["xray_feat2"],
             "caption": self.caption,
             "input_ids": self.input_ids,
+            "coarse_v_max_before_clip": coarse_v.max(),
+            "gt_v_max_before_clip": gt_v.max(),
+            "coarse_v_upper_clipped_ratio": (coarse_v > 1.0).float().mean(),
+            "gt_v_upper_clipped_ratio": (gt_v > 1.0).float().mean(),
         }
+        if self.use_xray_conditioning:
+            sample["xray_feat1"] = volume_info["xray_feat1"]
+            sample["xray_feat2"] = volume_info["xray_feat2"]
+        return sample
 
 
 def main(args):
@@ -231,6 +242,7 @@ def main(args):
         lora_rank_unet=args.lora_rank_unet,
         lora_rank_vae=args.lora_rank_vae,
         sd_turbo_path=args.pretrained_model_name_or_path,
+        use_xray_conditioning=args.use_xray_conditioning,
     )
     net_pix2pix.set_train()
 
@@ -258,9 +270,12 @@ def main(args):
     net_disc.train()
 
     net_lpips = lpips.LPIPS(net='vgg').cuda()
-    net_clip, _ = clip.load("ViT-B/32", device="cuda")
-    net_clip.requires_grad_(False)
-    net_clip.eval()
+    if args.lambda_clipsim > 0:
+        net_clip, _ = clip.load("ViT-B/32", device="cuda")
+        net_clip.requires_grad_(False)
+        net_clip.eval()
+    else:
+        net_clip = None
 
     net_lpips.requires_grad_(False)
 
@@ -279,7 +294,8 @@ def main(args):
         list(net_pix2pix.vae.decoder.skip_conv_2.parameters()) + \
         list(net_pix2pix.vae.decoder.skip_conv_3.parameters()) + \
         list(net_pix2pix.vae.decoder.skip_conv_4.parameters())
-    layers_to_opt += list(net_pix2pix.fusion_adapter.parameters())
+    if args.use_xray_conditioning:
+        layers_to_opt += list(net_pix2pix.fusion_adapter.parameters())
     # 防止 conv_in、skip_conv 或 LoRA 参数在不同收集路径中被重复加入。
     layers_to_opt = unique_parameters(layers_to_opt)
 
@@ -329,6 +345,7 @@ def main(args):
         case_paths=train_case_paths,
         tokenizer=net_pix2pix.tokenizer,
         prompt=prompt,
+        use_xray_conditioning=args.use_xray_conditioning,
     )
     dl_train = torch.utils.data.DataLoader(
         dataset_train,
@@ -340,6 +357,7 @@ def main(args):
         case_paths=val_case_paths,
         tokenizer=net_pix2pix.tokenizer,
         prompt=prompt,
+        use_xray_conditioning=args.use_xray_conditioning,
     )
     dl_val = torch.utils.data.DataLoader(dataset_val, batch_size=1, shuffle=False, num_workers=0)
 
@@ -347,7 +365,9 @@ def main(args):
     net_pix2pix, net_disc, optimizer, optimizer_disc, dl_train, lr_scheduler, lr_scheduler_disc = accelerator.prepare(
         net_pix2pix, net_disc, optimizer, optimizer_disc, dl_train, lr_scheduler, lr_scheduler_disc
     )
-    net_clip, net_lpips = accelerator.prepare(net_clip, net_lpips)
+    net_lpips = accelerator.prepare(net_lpips)
+    if net_clip is not None:
+        net_clip = accelerator.prepare(net_clip)
     # renorm with image net statistics
     t_clip_renorm = transforms.Normalize(mean=(0.48145466, 0.4578275, 0.40821073), std=(0.26862954, 0.26130258, 0.27577711))
     weight_dtype = torch.float32
@@ -361,7 +381,8 @@ def main(args):
     # 我们仅将不参与训练的参数(requires_grad=False)转为 fp16 节省显存，
     # 强制让所有参与训练的参数(requires_grad=True)保持为 float32。
     net_lpips.to(dtype=weight_dtype)
-    net_clip.to(dtype=weight_dtype)
+    if net_clip is not None:
+        net_clip.to(dtype=weight_dtype)
     
     for name, param in net_pix2pix.named_parameters():
         if not param.requires_grad:
@@ -407,8 +428,8 @@ def main(args):
             with accelerator.accumulate(*l_acc):
                 x_src = batch["conditioning_pixel_values"].cuda()
                 x_tgt = batch["output_pixel_values"].cuda()
-                xray_feat1 = batch["xray_feat1"].cuda()
-                xray_feat2 = batch["xray_feat2"].cuda()
+                xray_feat1 = batch["xray_feat1"].cuda() if args.use_xray_conditioning else None
+                xray_feat2 = batch["xray_feat2"].cuda() if args.use_xray_conditioning else None
                 B, C, H, W = x_src.shape
                 # forward pass
                 x_tgt_pred = net_pix2pix(
@@ -501,11 +522,10 @@ def main(args):
                     logs["lossD"] = lossD.detach().item()
                     logs["loss_l2"] = loss_l2.detach().item()
                     logs["loss_lpips"] = loss_lpips.detach().item()
-                    high_value_mask = x_tgt > 1.0
-                    if high_value_mask.any():
-                        high_value_error_v = (x_tgt_pred - x_tgt).abs()[high_value_mask] * 0.5
-                        logs["high_value_mae_v"] = high_value_error_v.mean().detach().item()
-                        logs["high_value_l2_v"] = (high_value_error_v ** 2).mean().detach().item()
+                    logs["input_v_max_before_clip"] = batch["coarse_v_max_before_clip"].max().item()
+                    logs["target_v_max_before_clip"] = batch["gt_v_max_before_clip"].max().item()
+                    logs["input_v_upper_clipped_ratio"] = batch["coarse_v_upper_clipped_ratio"].mean().item()
+                    logs["target_v_upper_clipped_ratio"] = batch["gt_v_upper_clipped_ratio"].mean().item()
                     logs["pred_s_max"] = x_tgt_pred.max().detach().item()
                     logs["target_s_max"] = x_tgt.max().detach().item()
                     if args.lambda_clipsim > 0:
@@ -542,8 +562,8 @@ def main(args):
                                 break
                             x_src = batch_val["conditioning_pixel_values"].cuda()
                             x_tgt = batch_val["output_pixel_values"].cuda()
-                            xray_feat1 = batch_val["xray_feat1"].cuda()
-                            xray_feat2 = batch_val["xray_feat2"].cuda()
+                            xray_feat1 = batch_val["xray_feat1"].cuda() if args.use_xray_conditioning else None
+                            xray_feat2 = batch_val["xray_feat2"].cuda() if args.use_xray_conditioning else None
                             B, C, H, W = x_src.shape
                             assert B == 1, "Use batch size 1 for eval."
                             with torch.no_grad():
@@ -558,16 +578,14 @@ def main(args):
                                 # compute the reconstruction losses
                                 loss_l2 = F.mse_loss(x_tgt_pred.float(), x_tgt.float(), reduction="mean")
                                 loss_lpips = net_lpips(x_tgt_pred.float(), x_tgt.float()).mean()
-                                # compute clip similarity loss
-                                x_tgt_pred_renorm = t_clip_renorm(x_tgt_pred * 0.5 + 0.5)
-                                x_tgt_pred_renorm = F.interpolate(x_tgt_pred_renorm, (224, 224), mode="bilinear", align_corners=False)
-                                caption_tokens = clip.tokenize(batch_val["caption"], truncate=True).to(x_tgt_pred.device)
-                                clipsim, _ = net_clip(x_tgt_pred_renorm, caption_tokens)
-                                clipsim = clipsim.mean()
-
                                 l_l2.append(loss_l2.item())
                                 l_lpips.append(loss_lpips.item())
-                                l_clipsim.append(clipsim.item())
+                                if args.lambda_clipsim > 0:
+                                    x_tgt_pred_renorm = t_clip_renorm(x_tgt_pred * 0.5 + 0.5)
+                                    x_tgt_pred_renorm = F.interpolate(x_tgt_pred_renorm, (224, 224), mode="bilinear", align_corners=False)
+                                    caption_tokens = clip.tokenize(batch_val["caption"], truncate=True).to(x_tgt_pred.device)
+                                    clipsim, _ = net_clip(x_tgt_pred_renorm, caption_tokens)
+                                    l_clipsim.append(clipsim.mean().item())
                             # save output images to file for FID evaluation
                             if args.track_val_fid:
                                 output_pil = transforms.ToPILImage()(x_tgt_pred[0].cpu() * 0.5 + 0.5)
@@ -581,7 +599,8 @@ def main(args):
                             logs["val/clean_fid"] = fid_score
                         logs["val/l2"] = np.mean(l_l2)
                         logs["val/lpips"] = np.mean(l_lpips)
-                        logs["val/clipsim"] = np.mean(l_clipsim)
+                        if args.lambda_clipsim > 0:
+                            logs["val/clipsim"] = np.mean(l_clipsim)
                         
                         # 验证阶段也同步记录三张图，方便直接对比 input / target / output。
                         # 这里保留最后一个 val batch 的结果作为可视化样本。

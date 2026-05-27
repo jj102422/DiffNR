@@ -51,6 +51,11 @@ def parse_args_paired_training(input_args=None):
     parser.add_argument("--tokenizer_name", type=str, default=None)
     parser.add_argument("--lora_rank_unet", default=8, type=int)
     parser.add_argument("--lora_rank_vae", default=4, type=int)
+    parser.add_argument(
+        "--use_xray_conditioning",
+        action="store_true",
+        help="Condition SliceFixer on the two precomputed RAD-DINO projection embeddings.",
+    )
 
     # training details
     parser.add_argument("--output_dir", required=True)
@@ -63,7 +68,7 @@ def parse_args_paired_training(input_args=None):
     parser.add_argument("--checkpointing_steps", type=int, default=500,)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1, help="Number of updates steps to accumulate before performing a backward/update pass.",)
     parser.add_argument("--gradient_checkpointing", action="store_true",)
-    parser.add_argument("--learning_rate", type=float, default=5e-6)
+    parser.add_argument("--learning_rate", type=float, default=1e-5)
     parser.add_argument("--lr_scheduler", type=str, default="constant",
         help=(
             'The scheduler type to use. Choose between ["linear", "cosine", "cosine_with_restarts", "polynomial",'

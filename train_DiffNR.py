@@ -140,7 +140,7 @@ def enhance_slice_with_slicefixer(slicefixer, slice_data, prompt, xray_feat1, xr
 
     except Exception as e:
         print(f"Error in SliceFixer enhancement: {e}")
-        return torch.clamp_min(slice_data.float().cuda().unsqueeze(0), 0.0)
+        return torch.clamp(slice_data.float().cuda().unsqueeze(0), 0.0, 1.0)
 
 
 # Extract slices from predicted CT volume during training
@@ -396,15 +396,12 @@ def training(
                 slices = extract_slices(vol_pred)
                 diffusion_enhanced_slices = []
                 
-                # 设置prompt
+                # Keep inference conditioning consistent with SliceFixer finetuning.
+                prompt = "high quality medical CT slice, clear anatomical structures"
                 if organ_type == "Chest":
-                    prompt = "remove artifacts for this chest CT slice"
                     print("Processing Chest CT with SliceFixer")
                 elif organ_type == "Tooth":
-                    prompt = "remove artifacts for this tooth CT slice"
                     print("Processing Tooth CT with SliceFixer")
-                else:
-                    prompt = "remove artifacts for this CT slice"
 
                 # 处理每个切片
                 for idx, slice_data in tqdm(enumerate(slices), total=len(slices), desc="SliceFixer enhancing slices"):

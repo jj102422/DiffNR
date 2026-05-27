@@ -14,11 +14,11 @@ from model import make_1step_sched, my_vae_encoder_fwd, my_vae_decoder_fwd, Cros
 
 
 INTENSITY_DOMAIN = {
-    "stored_volume": "v = clip(HU, 0, None) / 3000",
-    "model_input": "s = 2 * v - 1",
-    "model_output_inverse": "v = (s + 1) / 2",
-    "upper_clipping": False,
-    "model_lower_bound": -1.0,
+    "stored_volume": "v_saved = clip(HU, 0, None) / 3000; may exceed 1",
+    "model_input": "v = clip(v_saved, 0, 1); s = 2 * v - 1",
+    "model_output_inverse": "v = (clip(s, -1, 1) + 1) / 2",
+    "upper_clipping": True,
+    "model_range": [-1.0, 1.0],
 }
 XRAY_CONDITIONING = {
     "encoder": "microsoft/rad-dino",
@@ -49,8 +49,10 @@ class SliceFixer(torch.nn.Module):
         lora_rank_unet=8,
         lora_rank_vae=4,
         sd_turbo_path=None,
+        use_xray_conditioning=False,
     ):
         super().__init__()
+        self.use_xray_conditioning = use_xray_conditioning
         self.sd_turbo_path = (
             sd_turbo_path
             or os.environ.get("SD_TURBO_PATH")
@@ -163,14 +165,15 @@ class SliceFixer(torch.nn.Module):
 
         elif pretrained_path is not None:
             sd = torch.load(pretrained_path, map_location="cpu")
-            if "state_dict_fusion_adapter" not in sd:
+            self.use_xray_conditioning = sd.get("use_xray_conditioning", True)
+            if self.use_xray_conditioning and "state_dict_fusion_adapter" not in sd:
                 raise ValueError(
                     "SliceFixer checkpoint does not contain RAD-DINO fusion adapter weights. "
                     "Retrain with the high-HU/RAD-DINO conditioning pipeline."
                 )
             if sd.get("intensity_domain") != INTENSITY_DOMAIN:
                 raise ValueError("SliceFixer checkpoint intensity domain is incompatible with this pipeline.")
-            if sd.get("xray_conditioning") != XRAY_CONDITIONING:
+            if self.use_xray_conditioning and sd.get("xray_conditioning") != XRAY_CONDITIONING:
                 raise ValueError("SliceFixer checkpoint X-ray conditioning metadata is incompatible.")
             unet_lora_config = LoraConfig(r=sd["rank_unet"], init_lora_weights="gaussian", target_modules=sd["unet_lora_target_modules"])
             vae_lora_config = LoraConfig(r=sd["rank_vae"], init_lora_weights="gaussian", target_modules=sd["vae_lora_target_modules"])
@@ -184,7 +187,8 @@ class SliceFixer(torch.nn.Module):
             for k in sd["state_dict_unet"]:
                 _sd_unet[k] = sd["state_dict_unet"][k]
             unet.load_state_dict(_sd_unet)
-            self.fusion_adapter.load_state_dict(sd["state_dict_fusion_adapter"])
+            if self.use_xray_conditioning:
+                self.fusion_adapter.load_state_dict(sd["state_dict_fusion_adapter"])
             self.lora_rank_unet = sd["rank_unet"]
             self.lora_rank_vae = sd["rank_vae"]
             self.target_modules_vae = sd["vae_lora_target_modules"]
@@ -246,9 +250,13 @@ class SliceFixer(torch.nn.Module):
         self.vae.decoder.skip_conv_2.requires_grad_(True)
         self.vae.decoder.skip_conv_3.requires_grad_(True)
         self.vae.decoder.skip_conv_4.requires_grad_(True)
-        self.fusion_adapter.train()
-        for p in self.fusion_adapter.parameters():
-            p.requires_grad = True
+        if self.use_xray_conditioning:
+            self.fusion_adapter.train()
+            for p in self.fusion_adapter.parameters():
+                p.requires_grad = True
+        else:
+            self.fusion_adapter.eval()
+            self.fusion_adapter.requires_grad_(False)
 
     def forward(self, c_t, prompt=None, prompt_tokens=None, deterministic=True, r=1.0, noise_map=None, xray_feat1=None, xray_feat2=None):
         # either the prompt or the prompt_tokens should be provided
@@ -262,7 +270,9 @@ class SliceFixer(torch.nn.Module):
         else:
             caption_enc = self.text_encoder(prompt_tokens)[0]
         
-        if xray_feat1 is not None and xray_feat2 is not None:
+        if self.use_xray_conditioning:
+            if xray_feat1 is None or xray_feat2 is None:
+                raise ValueError("This SliceFixer model requires two RAD-DINO X-ray conditioning features.")
             xray_feats = torch.cat([xray_feat1, xray_feat2], dim=1)
             xray_feats = xray_feats.to(caption_enc.device, dtype=caption_enc.dtype)
             caption_enc = self.fusion_adapter(caption_enc, xray_feats)
@@ -272,7 +282,7 @@ class SliceFixer(torch.nn.Module):
             x_denoised = self.sched.step(model_pred, self.timesteps, encoded_control, return_dict=True).prev_sample
             x_denoised = x_denoised.to(model_pred.dtype)
             self.vae.decoder.incoming_skip_acts = self.vae.encoder.current_down_blocks
-            output_image = self.vae.decode(x_denoised / self.vae.config.scaling_factor).sample.clamp_min(-1.0)
+            output_image = self.vae.decode(x_denoised / self.vae.config.scaling_factor).sample.clamp(-1.0, 1.0)
         else:
             # scale the lora weights based on the r value
             self.unet.set_adapters(["default"], weights=[r])
@@ -287,7 +297,7 @@ class SliceFixer(torch.nn.Module):
             x_denoised = x_denoised.to(unet_output.dtype)
             self.vae.decoder.incoming_skip_acts = self.vae.encoder.current_down_blocks
             self.vae.decoder.gamma = r
-            output_image = self.vae.decode(x_denoised / self.vae.config.scaling_factor).sample.clamp_min(-1.0)
+            output_image = self.vae.decode(x_denoised / self.vae.config.scaling_factor).sample.clamp(-1.0, 1.0)
         return output_image
 
     def save_model(self, outf):
@@ -298,7 +308,9 @@ class SliceFixer(torch.nn.Module):
         sd["rank_vae"] = self.lora_rank_vae
         sd["state_dict_unet"] = {k: v for k, v in self.unet.state_dict().items() if "lora" in k or "conv_in" in k}
         sd["state_dict_vae"] = {k: v for k, v in self.vae.state_dict().items() if "lora" in k or "skip" in k}
-        sd["state_dict_fusion_adapter"] = self.fusion_adapter.state_dict()
+        sd["use_xray_conditioning"] = self.use_xray_conditioning
+        if self.use_xray_conditioning:
+            sd["state_dict_fusion_adapter"] = self.fusion_adapter.state_dict()
         sd["intensity_domain"] = INTENSITY_DOMAIN
-        sd["xray_conditioning"] = XRAY_CONDITIONING
+        sd["xray_conditioning"] = XRAY_CONDITIONING if self.use_xray_conditioning else None
         torch.save(sd, outf)
