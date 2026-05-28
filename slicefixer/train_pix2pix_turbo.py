@@ -1,13 +1,16 @@
 import os
+import atexit
 from pathlib import Path
 import zipfile
 import json
-import gc
+import random
 import sys
+import time
 import lpips
 import clip
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint
 import transformers
@@ -24,17 +27,62 @@ from diffusers.optimization import get_scheduler
 import wandb
 from cleanfid.fid import get_folder_features, build_feature_extractor, fid_from_feats
 # from pix2pix_turbo import Pix2Pix_Turbo
-sys.path.append("./slicefixer") # 确保能索引到 DiffNR 里的 slicefixer 模块
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT))
+sys.path.insert(0, str(REPO_ROOT / "slicefixer")) # 确保能索引到 DiffNR 里的 slicefixer 模块
 from SliceFixer import SliceFixer
 from intensity_utils import volume_to_slicefixer
 from my_utils.training_utils import parse_args_paired_training
+from volume_cache import TemporaryVolumeCache
+from r2_gaussian.utils.loss_utils import ssim as standard_ssim
 
 try:
-    sys.path.append("./r2_gaussian/submodules/fused-ssim")
+    sys.path.append(str(REPO_ROOT / "r2_gaussian/submodules/fused-ssim"))
     from fused_ssim import fused_ssim
     FUSED_SSIM_AVAILABLE = True
 except Exception:
     FUSED_SSIM_AVAILABLE = False
+
+
+def ssim_loss_and_value(pred, target):
+    pred_01 = (pred.float() + 1.0) * 0.5
+    target_01 = (target.float() + 1.0) * 0.5
+    if FUSED_SSIM_AVAILABLE:
+        ssim_value = fused_ssim(pred_01, target_01)
+    else:
+        ssim_value = standard_ssim(pred_01, target_01)
+    return 1.0 - ssim_value, ssim_value
+
+
+class ConditionalDiscriminator(nn.Module):
+    def __init__(self, discriminator, in_channels=6, image_channels=3):
+        super().__init__()
+        self.base_discriminator = discriminator
+        self.condition_adapter = nn.Conv2d(in_channels, image_channels, kernel_size=1)
+        self._init_as_target_passthrough(image_channels)
+
+    @property
+    def cv_ensemble(self):
+        return self.base_discriminator.cv_ensemble
+
+    def _init_as_target_passthrough(self, image_channels):
+        with torch.no_grad():
+            self.condition_adapter.weight.zero_()
+            self.condition_adapter.bias.zero_()
+            for channel in range(image_channels):
+                self.condition_adapter.weight[channel, image_channels + channel, 0, 0] = 1.0
+
+    def forward(self, images, *args, **kwargs):
+        if images.shape[1] != self.condition_adapter.in_channels:
+            raise ValueError(
+                f"Conditional discriminator expected {self.condition_adapter.in_channels} channels, "
+                f"got {images.shape[1]}."
+            )
+        return self.base_discriminator(self.condition_adapter(images), *args, **kwargs)
+
+
+def make_conditional_disc_input(x_src, x_img):
+    return torch.cat([x_src, x_img], dim=1)
 
 
 def normalize_to_255(img):
@@ -99,20 +147,34 @@ def get_volume_info(path):
     return arr.shape, arr.dtype, None
 
 
-def load_volume_slice(path, slice_idx, key=None):
+def load_volume_slice(path, slice_idx, key=None, mmap_cache=None):
     if path.endswith(".npz"):
         with np.load(path) as data:
             array_key = key or (Path(path).stem if Path(path).stem in data.files else data.files[0])
             return data[array_key][:, :, slice_idx]
 
-    arr = np.load(path, mmap_mode="r")
+    if mmap_cache is not None:
+        arr = mmap_cache.get(path)
+        if arr is None:
+            arr = np.load(path, mmap_mode="r")
+            mmap_cache[path] = arr
+    else:
+        arr = np.load(path, mmap_mode="r")
     return arr[:, :, slice_idx]
 
 
 class MedicalCTDataset(torch.utils.data.Dataset):
-    def __init__(self, case_paths, tokenizer, prompt):
+    def __init__(
+        self,
+        case_paths,
+        tokenizer,
+        prompt,
+        use_xray_conditioning=False,
+        volume_path_overrides=None,
+    ):
         self.case_paths = case_paths
         self.caption = prompt
+        self.use_xray_conditioning = use_xray_conditioning
         self.input_ids = tokenizer(
             prompt,
             max_length=tokenizer.model_max_length,
@@ -122,24 +184,29 @@ class MedicalCTDataset(torch.utils.data.Dataset):
         ).input_ids[0]
         self.index_map = []
         self._volume_info = {}
+        self._mmap_cache = {}
+        self.volume_path_overrides = volume_path_overrides or {}
 
         for case_path in self.case_paths:
-            coarse_candidates = [
-                os.path.join(case_path, "vol_pred.npz"),
-                os.path.join(case_path, "vol_pred.npy"),
-            ]
-            coarse_path = next((p for p in coarse_candidates if os.path.exists(p)), None)
-            gt_candidates = [
-                os.path.join(case_path, "volume_gt.npz"),
-                os.path.join(case_path, "volume_gt.npy"),
-                os.path.join(case_path, "vol_gt.npz"),
-                os.path.join(case_path, "vol_gt.npy"),
-            ]
-            gt_path = next((p for p in gt_candidates if os.path.exists(p)), None)
+            override = self.volume_path_overrides.get(str(case_path), {})
+            coarse_path = override.get("coarse_path")
+            gt_path = override.get("gt_path")
+            if coarse_path is None:
+                coarse_candidates = [
+                    os.path.join(case_path, "vol_pred.npz"),
+                    os.path.join(case_path, "vol_pred.npy"),
+                ]
+                coarse_path = next((p for p in coarse_candidates if os.path.exists(p)), None)
+            if gt_path is None:
+                gt_candidates = [
+                    os.path.join(case_path, "volume_gt.npz"),
+                    os.path.join(case_path, "volume_gt.npy"),
+                    os.path.join(case_path, "vol_gt.npz"),
+                    os.path.join(case_path, "vol_gt.npy"),
+                ]
+                gt_path = next((p for p in gt_candidates if os.path.exists(p)), None)
             case_name = os.path.basename(case_path.rstrip(os.sep))
-            xray_path1 = os.path.join(case_path, f"{case_name}_xray_1.pt")
-            xray_path2 = os.path.join(case_path, f"{case_name}_xray_2.pt")
-            if coarse_path is None or gt_path is None or not os.path.exists(xray_path1) or not os.path.exists(xray_path2):
+            if coarse_path is None or gt_path is None:
                 continue
 
             coarse_shape, _, coarse_key = get_volume_info(coarse_path)
@@ -148,22 +215,28 @@ class MedicalCTDataset(torch.utils.data.Dataset):
                 continue
             if coarse_shape != gt_shape:
                 continue
-            xray_feat1 = torch.load(xray_path1, map_location="cpu").float()
-            xray_feat2 = torch.load(xray_path2, map_location="cpu").float()
-            if tuple(xray_feat1.shape) != (1, 768) or tuple(xray_feat2.shape) != (1, 768):
-                raise ValueError(
-                    f"Expected RAD-DINO CLS features [1, 768] for {case_name}; "
-                    f"got {tuple(xray_feat1.shape)} and {tuple(xray_feat2.shape)}. "
-                    "Run scripts/extract_rad_dino_xray_features.py first."
-                )
-            self._volume_info[case_path] = {
+            volume_info = {
                 "coarse_path": coarse_path,
                 "coarse_key": coarse_key,
                 "gt_path": gt_path,
                 "gt_key": gt_key,
-                "xray_feat1": xray_feat1,
-                "xray_feat2": xray_feat2,
             }
+            if self.use_xray_conditioning:
+                xray_path1 = os.path.join(case_path, f"{case_name}_xray_1.pt")
+                xray_path2 = os.path.join(case_path, f"{case_name}_xray_2.pt")
+                if not os.path.exists(xray_path1) or not os.path.exists(xray_path2):
+                    continue
+                xray_feat1 = torch.load(xray_path1, map_location="cpu").float()
+                xray_feat2 = torch.load(xray_path2, map_location="cpu").float()
+                if tuple(xray_feat1.shape) != (1, 768) or tuple(xray_feat2.shape) != (1, 768):
+                    raise ValueError(
+                        f"Expected RAD-DINO CLS features [1, 768] for {case_name}; "
+                        f"got {tuple(xray_feat1.shape)} and {tuple(xray_feat2.shape)}. "
+                        "Run scripts/extract_rad_dino_xray_features.py first."
+                    )
+                volume_info["xray_feat1"] = xray_feat1
+                volume_info["xray_feat2"] = xray_feat2
+            self._volume_info[case_path] = volume_info
             # 这里的 volume_gt.npy / vol_pred.npy 已经在数据生成阶段转成 XYZ 顺序，
             # 因此 axis 2 才是 axial 方向；索引范围也要跟着改成 shape[2]。
             for slice_idx in range(coarse_shape[2]):
@@ -180,11 +253,13 @@ class MedicalCTDataset(torch.utils.data.Dataset):
             volume_info["coarse_path"],
             slice_idx,
             volume_info["coarse_key"],
+            self._mmap_cache,
         )
         gt_slice = load_volume_slice(
             volume_info["gt_path"],
             slice_idx,
             volume_info["gt_key"],
+            self._mmap_cache,
         )
 
         # 这里需要 copy 一份，避免 mmap 读出的只读 numpy 数组直接转 tensor 时触发警告。
@@ -194,14 +269,21 @@ class MedicalCTDataset(torch.utils.data.Dataset):
         coarse_tensor = volume_to_slicefixer(coarse_v).repeat(3, 1, 1)
         gt_tensor = volume_to_slicefixer(gt_v).repeat(3, 1, 1)
 
-        return {
+        sample = {
+            "sample_index": torch.tensor(idx, dtype=torch.long),
             "conditioning_pixel_values": coarse_tensor,
             "output_pixel_values": gt_tensor,
-            "xray_feat1": volume_info["xray_feat1"],
-            "xray_feat2": volume_info["xray_feat2"],
             "caption": self.caption,
             "input_ids": self.input_ids,
+            "coarse_v_max_before_clip": coarse_v.max(),
+            "gt_v_max_before_clip": gt_v.max(),
+            "coarse_v_upper_clipped_ratio": (coarse_v > 1.0).float().mean(),
+            "gt_v_upper_clipped_ratio": (gt_v > 1.0).float().mean(),
         }
+        if self.use_xray_conditioning:
+            sample["xray_feat1"] = volume_info["xray_feat1"]
+            sample["xray_feat2"] = volume_info["xray_feat2"]
+        return sample
 
 
 def main(args):
@@ -227,10 +309,11 @@ def main(args):
 
     net_pix2pix = SliceFixer(
         pretrained_name=None,
-        pretrained_path=None,
+        pretrained_path=args.slicefixer_pretrained_path,
         lora_rank_unet=args.lora_rank_unet,
         lora_rank_vae=args.lora_rank_vae,
         sd_turbo_path=args.pretrained_model_name_or_path,
+        use_xray_conditioning=args.use_xray_conditioning,
     )
     net_pix2pix.set_train()
 
@@ -248,7 +331,8 @@ def main(args):
 
     if args.gan_disc_type == "vagan_clip":
         import vision_aided_loss
-        net_disc = vision_aided_loss.Discriminator(cv_type='clip', loss_type=args.gan_loss_type, device="cuda")
+        base_disc = vision_aided_loss.Discriminator(cv_type='clip', loss_type=args.gan_loss_type, device="cuda")
+        net_disc = ConditionalDiscriminator(base_disc)
     else:
         raise NotImplementedError(f"Discriminator type {args.gan_disc_type} not implemented")
 
@@ -258,9 +342,12 @@ def main(args):
     net_disc.train()
 
     net_lpips = lpips.LPIPS(net='vgg').cuda()
-    net_clip, _ = clip.load("ViT-B/32", device="cuda")
-    net_clip.requires_grad_(False)
-    net_clip.eval()
+    if args.lambda_clipsim > 0:
+        net_clip, _ = clip.load("ViT-B/32", device="cuda")
+        net_clip.requires_grad_(False)
+        net_clip.eval()
+    else:
+        net_clip = None
 
     net_lpips.requires_grad_(False)
 
@@ -279,7 +366,8 @@ def main(args):
         list(net_pix2pix.vae.decoder.skip_conv_2.parameters()) + \
         list(net_pix2pix.vae.decoder.skip_conv_3.parameters()) + \
         list(net_pix2pix.vae.decoder.skip_conv_4.parameters())
-    layers_to_opt += list(net_pix2pix.fusion_adapter.parameters())
+    if args.use_xray_conditioning:
+        layers_to_opt += list(net_pix2pix.fusion_adapter.parameters())
     # 防止 conv_in、skip_conv 或 LoRA 参数在不同收集路径中被重复加入。
     layers_to_opt = unique_parameters(layers_to_opt)
 
@@ -325,29 +413,67 @@ def main(args):
     val_case_paths = to_case_paths(val_ids)
 
     prompt = "high quality medical CT slice, clear anatomical structures"
-    dataset_train = MedicalCTDataset(
-        case_paths=train_case_paths,
-        tokenizer=net_pix2pix.tokenizer,
-        prompt=prompt,
-    )
-    dl_train = torch.utils.data.DataLoader(
-        dataset_train,
-        batch_size=args.train_batch_size,
-        shuffle=True,
-        num_workers=args.dataloader_num_workers,
-    )
+    tokenizer = net_pix2pix.tokenizer
+    use_volume_cache = args.use_volume_cache and not args.disable_volume_cache
+    if args.volume_cache_cases_per_block < 1:
+        raise ValueError("--volume_cache_cases_per_block must be at least 1.")
+    if args.num_samples_eval < 1:
+        raise ValueError("--num_samples_eval must be at least 1.")
+    volume_cache = None
+    val_cache_stats = None
+    if use_volume_cache:
+        run_id = Path(args.output_dir).name
+        volume_cache = TemporaryVolumeCache(args.volume_cache_dir, run_id)
+        if accelerator.is_main_process:
+            volume_cache.cleanup()
+            atexit.register(volume_cache.cleanup)
+            val_cache_stats = volume_cache.materialize_block("validation", val_case_paths)
+        accelerator.wait_for_everyone()
+        val_overrides = volume_cache.path_overrides("validation", val_case_paths)
+    else:
+        val_overrides = None
+
     dataset_val = MedicalCTDataset(
         case_paths=val_case_paths,
-        tokenizer=net_pix2pix.tokenizer,
+        tokenizer=tokenizer,
         prompt=prompt,
+        use_xray_conditioning=args.use_xray_conditioning,
+        volume_path_overrides=val_overrides,
     )
+    val_sample_count = min(args.num_samples_eval, len(dataset_val))
+    if val_sample_count == 0:
+        raise ValueError("Validation split contains no readable volume slices.")
+    dataset_val = torch.utils.data.Subset(dataset_val, range(val_sample_count))
     dl_val = torch.utils.data.DataLoader(dataset_val, batch_size=1, shuffle=False, num_workers=0)
 
+    def build_train_dataloader(case_paths, volume_path_overrides=None):
+        dataset = MedicalCTDataset(
+            case_paths=case_paths,
+            tokenizer=tokenizer,
+            prompt=prompt,
+            use_xray_conditioning=args.use_xray_conditioning,
+            volume_path_overrides=volume_path_overrides,
+        )
+        dataloader = torch.utils.data.DataLoader(
+            dataset,
+            batch_size=args.train_batch_size,
+            shuffle=True,
+            num_workers=args.dataloader_num_workers,
+        )
+        return accelerator.prepare(dataloader)
+
+    dl_train = None
+    if not use_volume_cache:
+        dl_train = build_train_dataloader(train_case_paths)
+
     # Prepare everything with our `accelerator`.
-    net_pix2pix, net_disc, optimizer, optimizer_disc, dl_train, lr_scheduler, lr_scheduler_disc = accelerator.prepare(
-        net_pix2pix, net_disc, optimizer, optimizer_disc, dl_train, lr_scheduler, lr_scheduler_disc
+    net_pix2pix, net_disc, optimizer, optimizer_disc, lr_scheduler, lr_scheduler_disc = accelerator.prepare(
+        net_pix2pix, net_disc, optimizer, optimizer_disc, lr_scheduler, lr_scheduler_disc
     )
-    net_clip, net_lpips = accelerator.prepare(net_clip, net_lpips)
+    dl_val = accelerator.prepare(dl_val)
+    net_lpips = accelerator.prepare(net_lpips)
+    if net_clip is not None:
+        net_clip = accelerator.prepare(net_clip)
     # renorm with image net statistics
     t_clip_renorm = transforms.Normalize(mean=(0.48145466, 0.4578275, 0.40821073), std=(0.26862954, 0.26130258, 0.27577711))
     weight_dtype = torch.float32
@@ -361,7 +487,8 @@ def main(args):
     # 我们仅将不参与训练的参数(requires_grad=False)转为 fp16 节省显存，
     # 强制让所有参与训练的参数(requires_grad=True)保持为 float32。
     net_lpips.to(dtype=weight_dtype)
-    net_clip.to(dtype=weight_dtype)
+    if net_clip is not None:
+        net_clip.to(dtype=weight_dtype)
     
     for name, param in net_pix2pix.named_parameters():
         if not param.requires_grad:
@@ -375,10 +502,15 @@ def main(args):
     # The trackers initializes automatically on the main process.
     if accelerator.is_main_process:
         tracker_config = dict(vars(args))
+        tracker_config["effective_batch_size"] = (
+            accelerator.num_processes
+            * args.train_batch_size
+            * args.gradient_accumulation_steps
+        )
         init_kwargs = {"wandb": {"name": args.tracker_run_name}} if args.tracker_run_name else {}
         accelerator.init_trackers(args.tracker_project_name, config=tracker_config, init_kwargs=init_kwargs)
 
-    progress_bar = tqdm(range(0, args.max_train_steps), initial=0, desc="Steps",
+    progress_bar = tqdm(range(0, args.max_train_steps), initial=args.initial_global_step, desc="Steps",
         disable=not accelerator.is_local_main_process,)
 
     # turn off eff. attn for the discriminator
@@ -399,16 +531,65 @@ def main(args):
                 shuffle=False, seed=0, batch_size=8, device=torch.device("cuda"),
                 mode="clean", custom_image_tranform=fn_transform, description="", verbose=True)
 
+    effective_batch_size = (
+        accelerator.num_processes
+        * args.train_batch_size
+        * args.gradient_accumulation_steps
+    )
+    if accelerator.is_main_process:
+        print(f"Effective batch size: {effective_batch_size}")
+
+    pending_cache_logs = {}
+
+    def iter_epoch_batches(epoch):
+        if not use_volume_cache:
+            yield from dl_train
+            return
+
+        shuffled_cases = list(train_case_paths)
+        rng = random.Random((args.seed or 0) + epoch)
+        rng.shuffle(shuffled_cases)
+        for block_index in range(0, len(shuffled_cases), args.volume_cache_cases_per_block):
+            block_cases = shuffled_cases[
+                block_index : block_index + args.volume_cache_cases_per_block
+            ]
+            block_name = f"train_epoch_{epoch}_block_{block_index // args.volume_cache_cases_per_block}"
+            if accelerator.is_main_process:
+                stats = volume_cache.materialize_block(block_name, block_cases)
+                pending_cache_logs.update(
+                    {
+                        "cache/train_block_prepare_seconds": stats["seconds"],
+                        "cache/block_bytes": stats["bytes"],
+                        "cache/block_cases": stats["cases"],
+                    }
+                )
+            accelerator.wait_for_everyone()
+            overrides = volume_cache.path_overrides(block_name, block_cases)
+            block_loader = build_train_dataloader(block_cases, overrides)
+            yield from block_loader
+            del block_loader
+            accelerator.wait_for_everyone()
+            if accelerator.is_main_process:
+                cleanup_started = time.perf_counter()
+                volume_cache.cleanup_block(block_name)
+                pending_cache_logs["cache/train_block_cleanup_seconds"] = (
+                    time.perf_counter() - cleanup_started
+                )
+            accelerator.wait_for_everyone()
+
     # start the training loop
-    global_step = 0
-    for epoch in range(0, args.num_training_epochs):
-        for step, batch in enumerate(dl_train):
+    global_step = args.initial_global_step
+    train_started = time.perf_counter()
+    last_optimizer_step_time = train_started
+    epoch = 0
+    while global_step < args.max_train_steps:
+        for step, batch in enumerate(iter_epoch_batches(epoch)):
             l_acc = [net_pix2pix, net_disc]
             with accelerator.accumulate(*l_acc):
                 x_src = batch["conditioning_pixel_values"].cuda()
                 x_tgt = batch["output_pixel_values"].cuda()
-                xray_feat1 = batch["xray_feat1"].cuda()
-                xray_feat2 = batch["xray_feat2"].cuda()
+                xray_feat1 = batch["xray_feat1"].cuda() if args.use_xray_conditioning else None
+                xray_feat2 = batch["xray_feat2"].cuda() if args.use_xray_conditioning else None
                 B, C, H, W = x_src.shape
                 # forward pass
                 x_tgt_pred = net_pix2pix(
@@ -436,20 +617,18 @@ def main(args):
                     clipsim, _ = net_clip(x_tgt_pred_renorm, caption_tokens)
                     loss_clipsim = (1 - clipsim.mean() / 100) * args.lambda_clipsim
 
-                # SSIM loss
-                if args.lambda_ssim > 0 and not FUSED_SSIM_AVAILABLE:
-                    raise ValueError(
-                        "fused_ssim is required for SSIM loss. Please install fused_ssim."
-                    )
                 loss_ssim = torch.tensor(0.0, device=x_tgt_pred.device)
                 if args.lambda_ssim > 0:
-                    pred_01 = (x_tgt_pred + 1.0) * 0.5
-                    tgt_01 = (x_tgt + 1.0) * 0.5
-                    ssim_val = fused_ssim(pred_01, tgt_01)
-                    loss_ssim = (1.0 - ssim_val) * args.lambda_ssim
+                    ssim_loss, _ = ssim_loss_and_value(x_tgt_pred, x_tgt)
+                    loss_ssim = ssim_loss * args.lambda_ssim
+
+                gan_enabled = args.lambda_gan > 0 and global_step >= args.gan_warmup_steps
 
                 # GAN loss for generator
-                loss_gan = net_disc(x_tgt_pred, for_G=True).mean() * args.lambda_gan
+                loss_gan = torch.tensor(0.0, device=x_tgt_pred.device)
+                if gan_enabled:
+                    fake_pair_for_g = make_conditional_disc_input(x_src, x_tgt_pred)
+                    loss_gan = net_disc(fake_pair_for_g, for_G=True).mean() * args.lambda_gan
 
                 # Total generator loss (paper formula)
                 loss = loss_l2 + loss_lpips + loss_clipsim + loss_gan + loss_ssim
@@ -475,37 +654,42 @@ def main(args):
                 # 导致混合精度的 GradScaler 状态异常并直接报错或产生 NaN。
                 # 正确的做法：真实和生成的 loss 相加，一个 batch 内只执行一次统一的 backward 和 step。
                 # real vs fake
-                lossD_real = net_disc(x_tgt.detach(), for_real=True).mean() * args.lambda_gan
-                lossD_fake = net_disc(x_tgt_pred.detach(), for_real=False).mean() * args.lambda_gan
-                
-                lossD = lossD_real + lossD_fake
-                accelerator.backward(lossD)
+                lossD = torch.tensor(0.0, device=x_tgt_pred.device)
+                if gan_enabled:
+                    optimizer_disc.zero_grad(set_to_none=args.set_grads_to_none)
+                    real_pair = make_conditional_disc_input(x_src.detach(), x_tgt.detach())
+                    fake_pair = make_conditional_disc_input(x_src.detach(), x_tgt_pred.detach())
+                    lossD_real = net_disc(real_pair, for_real=True).mean() * args.lambda_gan
+                    lossD_fake = net_disc(fake_pair, for_real=False).mean() * args.lambda_gan
 
-                # [修复 NaN 错误] 同样重新启用判别器的梯度裁剪，控制判别器的更新幅度
-                if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(net_disc.parameters(), args.max_grad_norm)
-                
-                optimizer_disc.step()
-                lr_scheduler_disc.step()
-                optimizer_disc.zero_grad(set_to_none=args.set_grads_to_none)
+                    lossD = lossD_real + lossD_fake
+                    accelerator.backward(lossD)
+
+                    # [修复 NaN 错误] 同样重新启用判别器的梯度裁剪，控制判别器的更新幅度
+                    if accelerator.sync_gradients:
+                        accelerator.clip_grad_norm_(net_disc.parameters(), args.max_grad_norm)
+
+                    optimizer_disc.step()
+                    lr_scheduler_disc.step()
+                    optimizer_disc.zero_grad(set_to_none=args.set_grads_to_none)
 
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
                 progress_bar.update(1)
                 global_step += 1
 
+                logs = {}
                 if accelerator.is_main_process:
-                    logs = {}
                     # log all the losses
                     logs["lossG"] = loss.detach().item()
                     logs["lossD"] = lossD.detach().item()
                     logs["loss_l2"] = loss_l2.detach().item()
                     logs["loss_lpips"] = loss_lpips.detach().item()
-                    high_value_mask = x_tgt > 1.0
-                    if high_value_mask.any():
-                        high_value_error_v = (x_tgt_pred - x_tgt).abs()[high_value_mask] * 0.5
-                        logs["high_value_mae_v"] = high_value_error_v.mean().detach().item()
-                        logs["high_value_l2_v"] = (high_value_error_v ** 2).mean().detach().item()
+                    logs["gan_active"] = float(gan_enabled)
+                    logs["input_v_max_before_clip"] = batch["coarse_v_max_before_clip"].max().item()
+                    logs["target_v_max_before_clip"] = batch["gt_v_max_before_clip"].max().item()
+                    logs["input_v_upper_clipped_ratio"] = batch["coarse_v_upper_clipped_ratio"].mean().item()
+                    logs["target_v_upper_clipped_ratio"] = batch["gt_v_upper_clipped_ratio"].mean().item()
                     logs["pred_s_max"] = x_tgt_pred.max().detach().item()
                     logs["target_s_max"] = x_tgt.max().detach().item()
                     if args.lambda_clipsim > 0:
@@ -514,6 +698,17 @@ def main(args):
                         logs["loss_ssim"] = loss_ssim.detach().item()
                     if args.lambda_gan > 0:
                         logs["loss_gan"] = loss_gan.detach().item()
+                    current_time = time.perf_counter()
+                    logs["config/effective_batch_size"] = effective_batch_size
+                    logs["timing/train_step_seconds"] = current_time - last_optimizer_step_time
+                    logs["throughput/train_steps_per_second"] = global_step / (
+                        current_time - train_started
+                    )
+                    if val_cache_stats is not None:
+                        logs["cache/val_prepare_seconds"] = val_cache_stats["seconds"]
+                        val_cache_stats = None
+                    logs.update(pending_cache_logs)
+                    pending_cache_logs.clear()
                     progress_bar.set_postfix(**logs)
 
                     # viz some images
@@ -532,70 +727,101 @@ def main(args):
                         outf = os.path.join(args.output_dir, "checkpoints", f"model_{global_step}.pkl")
                         accelerator.unwrap_model(net_pix2pix).save_model(outf)
 
-                    # compute validation set FID, L2, LPIPS, CLIP-SIM
-                    if global_step % args.eval_freq == 1:
-                        l_l2, l_lpips, l_clipsim = [], [], []
-                        if args.track_val_fid:
-                            os.makedirs(os.path.join(args.output_dir, "eval", f"fid_{global_step}"), exist_ok=True)
-                        for step, batch_val in enumerate(dl_val):
-                            if step >= args.num_samples_eval:
-                                break
-                            x_src = batch_val["conditioning_pixel_values"].cuda()
-                            x_tgt = batch_val["output_pixel_values"].cuda()
-                            xray_feat1 = batch_val["xray_feat1"].cuda()
-                            xray_feat2 = batch_val["xray_feat2"].cuda()
-                            B, C, H, W = x_src.shape
-                            assert B == 1, "Use batch size 1 for eval."
-                            with torch.no_grad():
-                                # forward pass
-                                x_tgt_pred = accelerator.unwrap_model(net_pix2pix)(
-                                    x_src,
-                                    prompt_tokens=batch_val["input_ids"].cuda(),
-                                    xray_feat1=xray_feat1,
-                                    xray_feat2=xray_feat2,
-                                    deterministic=True,
-                                )
-                                # compute the reconstruction losses
-                                loss_l2 = F.mse_loss(x_tgt_pred.float(), x_tgt.float(), reduction="mean")
-                                loss_lpips = net_lpips(x_tgt_pred.float(), x_tgt.float()).mean()
-                                # compute clip similarity loss
-                                x_tgt_pred_renorm = t_clip_renorm(x_tgt_pred * 0.5 + 0.5)
-                                x_tgt_pred_renorm = F.interpolate(x_tgt_pred_renorm, (224, 224), mode="bilinear", align_corners=False)
-                                caption_tokens = clip.tokenize(batch_val["caption"], truncate=True).to(x_tgt_pred.device)
-                                clipsim, _ = net_clip(x_tgt_pred_renorm, caption_tokens)
-                                clipsim = clipsim.mean()
+                # Validation runs on every rank; rank 0 only aggregates and records.
+                if global_step % args.eval_freq == 1:
+                    validation_started = time.perf_counter()
+                    fid_dir = os.path.join(args.output_dir, "eval", f"fid_{global_step}")
+                    if accelerator.is_main_process and args.track_val_fid:
+                        os.makedirs(fid_dir, exist_ok=True)
+                    accelerator.wait_for_everyone()
 
-                                l_l2.append(loss_l2.item())
-                                l_lpips.append(loss_lpips.item())
-                                l_clipsim.append(clipsim.item())
-                            # save output images to file for FID evaluation
+                    local_metrics = []
+                    val_preview = None
+                    net_pix2pix.eval()
+                    with torch.inference_mode():
+                        for val_step, batch_val in enumerate(dl_val):
+                            val_src = batch_val["conditioning_pixel_values"].cuda()
+                            val_tgt = batch_val["output_pixel_values"].cuda()
+                            val_xray_feat1 = batch_val["xray_feat1"].cuda() if args.use_xray_conditioning else None
+                            val_xray_feat2 = batch_val["xray_feat2"].cuda() if args.use_xray_conditioning else None
+                            val_pred = net_pix2pix(
+                                val_src,
+                                prompt_tokens=batch_val["input_ids"].cuda(),
+                                xray_feat1=val_xray_feat1,
+                                xray_feat2=val_xray_feat2,
+                                deterministic=True,
+                            )
+                            val_ssim_loss, val_ssim = ssim_loss_and_value(val_pred, val_tgt)
+                            metric_values = [
+                                F.mse_loss(val_pred.float(), val_tgt.float(), reduction="mean"),
+                                net_lpips(val_pred.float(), val_tgt.float()).mean(),
+                                val_ssim_loss,
+                                val_ssim,
+                            ]
+                            if args.lambda_clipsim > 0:
+                                pred_renorm = t_clip_renorm(val_pred * 0.5 + 0.5)
+                                pred_renorm = F.interpolate(
+                                    pred_renorm, (224, 224), mode="bilinear", align_corners=False
+                                )
+                                caption_tokens = clip.tokenize(
+                                    batch_val["caption"], truncate=True
+                                ).to(val_pred.device)
+                                clipsim, _ = net_clip(pred_renorm, caption_tokens)
+                                metric_values.append(clipsim.mean())
+                            local_metrics.append(torch.stack(metric_values))
+                            sample_index = int(batch_val["sample_index"][0].item())
+                            if val_preview is None or sample_index > val_preview[0]:
+                                val_preview = (sample_index, val_src[0], val_tgt[0], val_pred[0])
                             if args.track_val_fid:
-                                output_pil = transforms.ToPILImage()(x_tgt_pred[0].cpu() * 0.5 + 0.5)
-                                outf = os.path.join(args.output_dir, "eval", f"fid_{global_step}", f"val_{step}.png")
+                                output_pil = transforms.ToPILImage()(val_pred[0].cpu() * 0.5 + 0.5)
+                                outf = os.path.join(
+                                    fid_dir,
+                                    f"rank_{accelerator.process_index}_val_{val_step}.png",
+                                )
                                 output_pil.save(outf)
+
+                    metrics = torch.stack(local_metrics)
+                    metrics = accelerator.gather_for_metrics(metrics).float().cpu().numpy()
+                    preview_indices = accelerator.gather(
+                        torch.tensor([val_preview[0]], device=val_src.device)
+                    ).cpu()
+                    preview_images = accelerator.gather(
+                        torch.stack(val_preview[1:]).unsqueeze(0)
+                    ).cpu()
+                    net_pix2pix.train()
+                    accelerator.wait_for_everyone()
+                    if accelerator.is_main_process:
+                        logs["val/l2"] = float(np.mean(metrics[:, 0]))
+                        logs["val/lpips"] = float(np.mean(metrics[:, 1]))
+                        logs["val/ssim_loss"] = float(np.mean(metrics[:, 2]))
+                        logs["val/ssim"] = float(np.mean(metrics[:, 3]))
+                        if args.lambda_clipsim > 0:
+                            logs["val/clipsim"] = float(np.mean(metrics[:, 4]))
                         if args.track_val_fid:
-                            curr_stats = get_folder_features(os.path.join(args.output_dir, "eval", f"fid_{global_step}"), model=feat_model, num_workers=0, num=None,
+                            curr_stats = get_folder_features(fid_dir, model=feat_model, num_workers=0, num=None,
                                     shuffle=False, seed=0, batch_size=8, device=torch.device("cuda"),
                                     mode="clean", custom_image_tranform=fn_transform, description="", verbose=True)
-                            fid_score = fid_from_feats(ref_stats, curr_stats)
-                            logs["val/clean_fid"] = fid_score
-                        logs["val/l2"] = np.mean(l_l2)
-                        logs["val/lpips"] = np.mean(l_lpips)
-                        logs["val/clipsim"] = np.mean(l_clipsim)
-                        
-                        # 验证阶段也同步记录三张图，方便直接对比 input / target / output。
-                        # 这里保留最后一个 val batch 的结果作为可视化样本。
-                        logs["val/input"] = [wandb.Image(normalize_to_255(x_src[0]), caption="val_input")]
-                        logs["val/target"] = [wandb.Image(normalize_to_255(x_tgt[0]), caption="val_target")]
-                        logs["val/output"] = [wandb.Image(normalize_to_255(x_tgt_pred[0]), caption="val_output")]
-                        
-                        gc.collect()
-                        torch.cuda.empty_cache()
+                            logs["val/clean_fid"] = fid_from_feats(ref_stats, curr_stats)
+                        preview = preview_images[int(torch.argmax(preview_indices).item())]
+                        logs["val/input"] = [wandb.Image(normalize_to_255(preview[0]), caption="val_input")]
+                        logs["val/target"] = [wandb.Image(normalize_to_255(preview[1]), caption="val_target")]
+                        logs["val/output"] = [wandb.Image(normalize_to_255(preview[2]), caption="val_output")]
+                        logs["timing/validation_seconds"] = (
+                            time.perf_counter() - validation_started
+                        )
+
+                if accelerator.is_main_process:
                     accelerator.log(logs, step=global_step)
+                    last_optimizer_step_time = time.perf_counter()
             if global_step >= args.max_train_steps:
                 break
-        if global_step >= args.max_train_steps:
-            break
+        epoch += 1
+    accelerator.wait_for_everyone()
+    if accelerator.is_main_process and volume_cache is not None:
+        volume_cache.cleanup()
+    if accelerator.is_main_process and global_step > 0:
+        outf = os.path.join(args.output_dir, "checkpoints", f"model_{global_step}.pkl")
+        accelerator.unwrap_model(net_pix2pix).save_model(outf)
     accelerator.end_training()
 
 

@@ -26,6 +26,12 @@ def parse_args_paired_training(input_args=None):
     parser.add_argument("--lambda_l2", default=1.0, type=float)
     parser.add_argument("--lambda_clipsim", default=5.0, type=float)
     parser.add_argument("--lambda_ssim", default=1.0, type=float)
+    parser.add_argument(
+        "--gan_warmup_steps",
+        default=10_000,
+        type=int,
+        help="Number of optimizer steps to train without adversarial loss before enabling GAN.",
+    )
 
     # dataset options
     parser.add_argument("--dataset_folder", required=True, type=str)
@@ -34,23 +40,63 @@ def parse_args_paired_training(input_args=None):
     parser.add_argument("--info_json", default="info.json", type=str)
     parser.add_argument("--train_split", default="train", type=str)
     parser.add_argument("--val_split", default="eval", type=str)
+    volume_cache_group = parser.add_mutually_exclusive_group()
+    volume_cache_group.add_argument(
+        "--use_volume_cache",
+        action="store_true",
+        help="Temporarily unpack volume .npz files as mmap-readable .npy files.",
+    )
+    volume_cache_group.add_argument(
+        "--disable_volume_cache",
+        action="store_true",
+        help="Force direct reads from original volume files for benchmarking or fallback.",
+    )
+    parser.add_argument(
+        "--volume_cache_dir",
+        default="/dev/shm/slicefixer_volume_cache",
+        type=str,
+        help="Directory used for temporary uncompressed volume cache blocks.",
+    )
+    parser.add_argument(
+        "--volume_cache_cases_per_block",
+        default=8,
+        type=int,
+        help="Number of train cases materialized in each temporary cache block.",
+    )
 
     # validation eval args
-    parser.add_argument("--eval_freq", default=100, type=int)
+    parser.add_argument("--eval_freq", default=500, type=int)
     parser.add_argument("--track_val_fid", default=False, action="store_true")
     parser.add_argument("--num_samples_eval", type=int, default=100, help="Number of samples to use for all evaluation")
 
-    parser.add_argument("--viz_freq", type=int, default=100, help="Frequency of visualizing the outputs.")
+    parser.add_argument("--viz_freq", type=int, default=500, help="Frequency of visualizing the outputs.")
     parser.add_argument("--tracker_project_name", type=str, default="train_pix2pix_turbo", help="The name of the wandb project to log to.")
     parser.add_argument("--tracker_run_name", type=str, default=None, help="The name of the wandb run.")
 
     # details about the model architecture
     parser.add_argument("--pretrained_model_name_or_path")
+    parser.add_argument(
+        "--slicefixer_pretrained_path",
+        default=None,
+        type=str,
+        help="Optional SliceFixer LoRA checkpoint to initialize from when continuing an experiment.",
+    )
+    parser.add_argument(
+        "--initial_global_step",
+        default=0,
+        type=int,
+        help="Global step offset used when continuing from a SliceFixer checkpoint.",
+    )
     parser.add_argument("--revision", type=str, default=None,)
     parser.add_argument("--variant", type=str, default=None,)
     parser.add_argument("--tokenizer_name", type=str, default=None)
     parser.add_argument("--lora_rank_unet", default=8, type=int)
     parser.add_argument("--lora_rank_vae", default=4, type=int)
+    parser.add_argument(
+        "--use_xray_conditioning",
+        action="store_true",
+        help="Condition SliceFixer on the two precomputed RAD-DINO projection embeddings.",
+    )
 
     # training details
     parser.add_argument("--output_dir", required=True)
@@ -63,7 +109,7 @@ def parse_args_paired_training(input_args=None):
     parser.add_argument("--checkpointing_steps", type=int, default=500,)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1, help="Number of updates steps to accumulate before performing a backward/update pass.",)
     parser.add_argument("--gradient_checkpointing", action="store_true",)
-    parser.add_argument("--learning_rate", type=float, default=5e-6)
+    parser.add_argument("--learning_rate", type=float, default=1e-5)
     parser.add_argument("--lr_scheduler", type=str, default="constant",
         help=(
             'The scheduler type to use. Choose between ["linear", "cosine", "cosine_with_restarts", "polynomial",'
