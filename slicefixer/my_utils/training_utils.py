@@ -34,18 +34,53 @@ def parse_args_paired_training(input_args=None):
     parser.add_argument("--info_json", default="info.json", type=str)
     parser.add_argument("--train_split", default="train", type=str)
     parser.add_argument("--val_split", default="eval", type=str)
+    volume_cache_group = parser.add_mutually_exclusive_group()
+    volume_cache_group.add_argument(
+        "--use_volume_cache",
+        action="store_true",
+        help="Temporarily unpack volume .npz files as mmap-readable .npy files.",
+    )
+    volume_cache_group.add_argument(
+        "--disable_volume_cache",
+        action="store_true",
+        help="Force direct reads from original volume files for benchmarking or fallback.",
+    )
+    parser.add_argument(
+        "--volume_cache_dir",
+        default="/dev/shm/slicefixer_volume_cache",
+        type=str,
+        help="Directory used for temporary uncompressed volume cache blocks.",
+    )
+    parser.add_argument(
+        "--volume_cache_cases_per_block",
+        default=8,
+        type=int,
+        help="Number of train cases materialized in each temporary cache block.",
+    )
 
     # validation eval args
-    parser.add_argument("--eval_freq", default=100, type=int)
+    parser.add_argument("--eval_freq", default=500, type=int)
     parser.add_argument("--track_val_fid", default=False, action="store_true")
     parser.add_argument("--num_samples_eval", type=int, default=100, help="Number of samples to use for all evaluation")
 
-    parser.add_argument("--viz_freq", type=int, default=100, help="Frequency of visualizing the outputs.")
+    parser.add_argument("--viz_freq", type=int, default=500, help="Frequency of visualizing the outputs.")
     parser.add_argument("--tracker_project_name", type=str, default="train_pix2pix_turbo", help="The name of the wandb project to log to.")
     parser.add_argument("--tracker_run_name", type=str, default=None, help="The name of the wandb run.")
 
     # details about the model architecture
     parser.add_argument("--pretrained_model_name_or_path")
+    parser.add_argument(
+        "--slicefixer_pretrained_path",
+        default=None,
+        type=str,
+        help="Optional SliceFixer LoRA checkpoint to initialize from when continuing an experiment.",
+    )
+    parser.add_argument(
+        "--initial_global_step",
+        default=0,
+        type=int,
+        help="Global step offset used when continuing from a SliceFixer checkpoint.",
+    )
     parser.add_argument("--revision", type=str, default=None,)
     parser.add_argument("--variant", type=str, default=None,)
     parser.add_argument("--tokenizer_name", type=str, default=None)
