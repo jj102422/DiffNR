@@ -69,3 +69,5 @@ events.out.tfevents.*
 
 # 新增：忽略 Weights & Biases (wandb) 的本地运行记录
 wandb/
+
+.claude
