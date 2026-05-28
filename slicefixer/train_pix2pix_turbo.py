@@ -10,6 +10,7 @@ import lpips
 import clip
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint
 import transformers
@@ -26,18 +27,62 @@ from diffusers.optimization import get_scheduler
 import wandb
 from cleanfid.fid import get_folder_features, build_feature_extractor, fid_from_feats
 # from pix2pix_turbo import Pix2Pix_Turbo
-sys.path.append("./slicefixer") # 确保能索引到 DiffNR 里的 slicefixer 模块
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT))
+sys.path.insert(0, str(REPO_ROOT / "slicefixer")) # 确保能索引到 DiffNR 里的 slicefixer 模块
 from SliceFixer import SliceFixer
 from intensity_utils import volume_to_slicefixer
 from my_utils.training_utils import parse_args_paired_training
 from volume_cache import TemporaryVolumeCache
+from r2_gaussian.utils.loss_utils import ssim as standard_ssim
 
 try:
-    sys.path.append("./r2_gaussian/submodules/fused-ssim")
+    sys.path.append(str(REPO_ROOT / "r2_gaussian/submodules/fused-ssim"))
     from fused_ssim import fused_ssim
     FUSED_SSIM_AVAILABLE = True
 except Exception:
     FUSED_SSIM_AVAILABLE = False
+
+
+def ssim_loss_and_value(pred, target):
+    pred_01 = (pred.float() + 1.0) * 0.5
+    target_01 = (target.float() + 1.0) * 0.5
+    if FUSED_SSIM_AVAILABLE:
+        ssim_value = fused_ssim(pred_01, target_01)
+    else:
+        ssim_value = standard_ssim(pred_01, target_01)
+    return 1.0 - ssim_value, ssim_value
+
+
+class ConditionalDiscriminator(nn.Module):
+    def __init__(self, discriminator, in_channels=6, image_channels=3):
+        super().__init__()
+        self.base_discriminator = discriminator
+        self.condition_adapter = nn.Conv2d(in_channels, image_channels, kernel_size=1)
+        self._init_as_target_passthrough(image_channels)
+
+    @property
+    def cv_ensemble(self):
+        return self.base_discriminator.cv_ensemble
+
+    def _init_as_target_passthrough(self, image_channels):
+        with torch.no_grad():
+            self.condition_adapter.weight.zero_()
+            self.condition_adapter.bias.zero_()
+            for channel in range(image_channels):
+                self.condition_adapter.weight[channel, image_channels + channel, 0, 0] = 1.0
+
+    def forward(self, images, *args, **kwargs):
+        if images.shape[1] != self.condition_adapter.in_channels:
+            raise ValueError(
+                f"Conditional discriminator expected {self.condition_adapter.in_channels} channels, "
+                f"got {images.shape[1]}."
+            )
+        return self.base_discriminator(self.condition_adapter(images), *args, **kwargs)
+
+
+def make_conditional_disc_input(x_src, x_img):
+    return torch.cat([x_src, x_img], dim=1)
 
 
 def normalize_to_255(img):
@@ -286,7 +331,8 @@ def main(args):
 
     if args.gan_disc_type == "vagan_clip":
         import vision_aided_loss
-        net_disc = vision_aided_loss.Discriminator(cv_type='clip', loss_type=args.gan_loss_type, device="cuda")
+        base_disc = vision_aided_loss.Discriminator(cv_type='clip', loss_type=args.gan_loss_type, device="cuda")
+        net_disc = ConditionalDiscriminator(base_disc)
     else:
         raise NotImplementedError(f"Discriminator type {args.gan_disc_type} not implemented")
 
@@ -535,7 +581,8 @@ def main(args):
     global_step = args.initial_global_step
     train_started = time.perf_counter()
     last_optimizer_step_time = train_started
-    for epoch in range(0, args.num_training_epochs):
+    epoch = 0
+    while global_step < args.max_train_steps:
         for step, batch in enumerate(iter_epoch_batches(epoch)):
             l_acc = [net_pix2pix, net_disc]
             with accelerator.accumulate(*l_acc):
@@ -570,20 +617,18 @@ def main(args):
                     clipsim, _ = net_clip(x_tgt_pred_renorm, caption_tokens)
                     loss_clipsim = (1 - clipsim.mean() / 100) * args.lambda_clipsim
 
-                # SSIM loss
-                if args.lambda_ssim > 0 and not FUSED_SSIM_AVAILABLE:
-                    raise ValueError(
-                        "fused_ssim is required for SSIM loss. Please install fused_ssim."
-                    )
                 loss_ssim = torch.tensor(0.0, device=x_tgt_pred.device)
                 if args.lambda_ssim > 0:
-                    pred_01 = (x_tgt_pred + 1.0) * 0.5
-                    tgt_01 = (x_tgt + 1.0) * 0.5
-                    ssim_val = fused_ssim(pred_01, tgt_01)
-                    loss_ssim = (1.0 - ssim_val) * args.lambda_ssim
+                    ssim_loss, _ = ssim_loss_and_value(x_tgt_pred, x_tgt)
+                    loss_ssim = ssim_loss * args.lambda_ssim
+
+                gan_enabled = args.lambda_gan > 0 and global_step >= args.gan_warmup_steps
 
                 # GAN loss for generator
-                loss_gan = net_disc(x_tgt_pred, for_G=True).mean() * args.lambda_gan
+                loss_gan = torch.tensor(0.0, device=x_tgt_pred.device)
+                if gan_enabled:
+                    fake_pair_for_g = make_conditional_disc_input(x_src, x_tgt_pred)
+                    loss_gan = net_disc(fake_pair_for_g, for_G=True).mean() * args.lambda_gan
 
                 # Total generator loss (paper formula)
                 loss = loss_l2 + loss_lpips + loss_clipsim + loss_gan + loss_ssim
@@ -609,19 +654,24 @@ def main(args):
                 # 导致混合精度的 GradScaler 状态异常并直接报错或产生 NaN。
                 # 正确的做法：真实和生成的 loss 相加，一个 batch 内只执行一次统一的 backward 和 step。
                 # real vs fake
-                lossD_real = net_disc(x_tgt.detach(), for_real=True).mean() * args.lambda_gan
-                lossD_fake = net_disc(x_tgt_pred.detach(), for_real=False).mean() * args.lambda_gan
-                
-                lossD = lossD_real + lossD_fake
-                accelerator.backward(lossD)
+                lossD = torch.tensor(0.0, device=x_tgt_pred.device)
+                if gan_enabled:
+                    optimizer_disc.zero_grad(set_to_none=args.set_grads_to_none)
+                    real_pair = make_conditional_disc_input(x_src.detach(), x_tgt.detach())
+                    fake_pair = make_conditional_disc_input(x_src.detach(), x_tgt_pred.detach())
+                    lossD_real = net_disc(real_pair, for_real=True).mean() * args.lambda_gan
+                    lossD_fake = net_disc(fake_pair, for_real=False).mean() * args.lambda_gan
 
-                # [修复 NaN 错误] 同样重新启用判别器的梯度裁剪，控制判别器的更新幅度
-                if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(net_disc.parameters(), args.max_grad_norm)
-                
-                optimizer_disc.step()
-                lr_scheduler_disc.step()
-                optimizer_disc.zero_grad(set_to_none=args.set_grads_to_none)
+                    lossD = lossD_real + lossD_fake
+                    accelerator.backward(lossD)
+
+                    # [修复 NaN 错误] 同样重新启用判别器的梯度裁剪，控制判别器的更新幅度
+                    if accelerator.sync_gradients:
+                        accelerator.clip_grad_norm_(net_disc.parameters(), args.max_grad_norm)
+
+                    optimizer_disc.step()
+                    lr_scheduler_disc.step()
+                    optimizer_disc.zero_grad(set_to_none=args.set_grads_to_none)
 
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
@@ -635,6 +685,7 @@ def main(args):
                     logs["lossD"] = lossD.detach().item()
                     logs["loss_l2"] = loss_l2.detach().item()
                     logs["loss_lpips"] = loss_lpips.detach().item()
+                    logs["gan_active"] = float(gan_enabled)
                     logs["input_v_max_before_clip"] = batch["coarse_v_max_before_clip"].max().item()
                     logs["target_v_max_before_clip"] = batch["gt_v_max_before_clip"].max().item()
                     logs["input_v_upper_clipped_ratio"] = batch["coarse_v_upper_clipped_ratio"].mean().item()
@@ -700,9 +751,12 @@ def main(args):
                                 xray_feat2=val_xray_feat2,
                                 deterministic=True,
                             )
+                            val_ssim_loss, val_ssim = ssim_loss_and_value(val_pred, val_tgt)
                             metric_values = [
                                 F.mse_loss(val_pred.float(), val_tgt.float(), reduction="mean"),
                                 net_lpips(val_pred.float(), val_tgt.float()).mean(),
+                                val_ssim_loss,
+                                val_ssim,
                             ]
                             if args.lambda_clipsim > 0:
                                 pred_renorm = t_clip_renorm(val_pred * 0.5 + 0.5)
@@ -739,8 +793,10 @@ def main(args):
                     if accelerator.is_main_process:
                         logs["val/l2"] = float(np.mean(metrics[:, 0]))
                         logs["val/lpips"] = float(np.mean(metrics[:, 1]))
+                        logs["val/ssim_loss"] = float(np.mean(metrics[:, 2]))
+                        logs["val/ssim"] = float(np.mean(metrics[:, 3]))
                         if args.lambda_clipsim > 0:
-                            logs["val/clipsim"] = float(np.mean(metrics[:, 2]))
+                            logs["val/clipsim"] = float(np.mean(metrics[:, 4]))
                         if args.track_val_fid:
                             curr_stats = get_folder_features(fid_dir, model=feat_model, num_workers=0, num=None,
                                     shuffle=False, seed=0, batch_size=8, device=torch.device("cuda"),
@@ -759,8 +815,7 @@ def main(args):
                     last_optimizer_step_time = time.perf_counter()
             if global_step >= args.max_train_steps:
                 break
-        if global_step >= args.max_train_steps:
-            break
+        epoch += 1
     accelerator.wait_for_everyone()
     if accelerator.is_main_process and volume_cache is not None:
         volume_cache.cleanup()

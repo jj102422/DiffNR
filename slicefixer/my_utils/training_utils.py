@@ -26,6 +26,12 @@ def parse_args_paired_training(input_args=None):
     parser.add_argument("--lambda_l2", default=1.0, type=float)
     parser.add_argument("--lambda_clipsim", default=5.0, type=float)
     parser.add_argument("--lambda_ssim", default=1.0, type=float)
+    parser.add_argument(
+        "--gan_warmup_steps",
+        default=10_000,
+        type=int,
+        help="Number of optimizer steps to train without adversarial loss before enabling GAN.",
+    )
 
     # dataset options
     parser.add_argument("--dataset_folder", required=True, type=str)
