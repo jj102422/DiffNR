@@ -122,7 +122,7 @@ def initialize_slicefixer(model_path=None, sd_turbo_path=None, use_fp16=False):
 def enhance_slice_with_slicefixer(slicefixer, slice_data, prompt, xray_feat1, xray_feat2, use_fp16=False):
     try:
         original_hw = slice_data.shape[-2:]
-        slice_v = torch.clamp_min(slice_data.float().cuda().unsqueeze(0), 0.0)
+        slice_v = torch.clamp(slice_data.float().cuda().unsqueeze(0), 0.0, 1.0)
         slice_v = F.interpolate(slice_v, size=(512, 512), mode="bilinear", align_corners=False)
         c_t = volume_to_slicefixer(slice_v).repeat(1, 3, 1, 1)
         if use_fp16:
@@ -155,6 +155,10 @@ def extract_slices(vol_pred):
     #    s_max = s.max().item()
     #    print(f"Slice {i}: min={s_min:.4f}, max={s_max:.4f}")
     return slices
+
+
+def normalize_for_slicefixer_domain(volume):
+    return torch.clamp(volume.float(), 0.0, 1.0)
 
 def ssim3d(img1, img2):
     """Metrics for volume. img1 must be GT."""
@@ -417,12 +421,9 @@ def training(
                     enhanced_slice_clean = enhanced_slice_tensor.squeeze(0)  # [1, H, W]
                     diffusion_enhanced_slices.append(enhanced_slice_clean)
 
-
-                    diffusion_enhanced_volume = torch.stack(diffusion_enhanced_slices, dim=0)  # [N, 1, H, W]
-                    diffusion_enhanced_volume = diffusion_enhanced_volume.squeeze(1)  # [N, H, W] 
-                    diffusion_enhanced_volume = diffusion_enhanced_volume.permute(1, 2, 0).cuda()  # [H, W, N]
-
-                
+                diffusion_enhanced_volume = torch.stack(diffusion_enhanced_slices, dim=0)  # [N, 1, H, W]
+                diffusion_enhanced_volume = diffusion_enhanced_volume.squeeze(1)  # [N, H, W]
+                diffusion_enhanced_volume = diffusion_enhanced_volume.permute(1, 2, 0).cuda()  # [H, W, N]
 
                 processing_time = time.time() - start_time
                 print(f"SliceFixer enhancement completed in {processing_time:.2f}s for {len(slices)} slices")
@@ -437,20 +438,21 @@ def training(
                         scanner_cfg["sVoxel"],
                         pipe,
                     )["vol"]
+                    vol_pred_for_diffusion = normalize_for_slicefixer_domain(vol_pred)
                     
                     if opt.lambda_diffusion_ssim > 0:
 
                         if FUSED_SSIM_AVAILABLE:
-                            diffusion_ssim, _ = ssim3d(diffusion_enhanced_volume, vol_pred)
+                            diffusion_ssim, _ = ssim3d(diffusion_enhanced_volume, vol_pred_for_diffusion)
                         else:
-                            diffusion_ssim, _ = metric_vol_loss(diffusion_enhanced_volume, vol_pred, "ssim")
+                            diffusion_ssim, _ = metric_vol_loss(diffusion_enhanced_volume, vol_pred_for_diffusion, "ssim")
                         diffusion_ssim_loss = 1.0 - diffusion_ssim
                         loss["diffusion_ssim"] = opt.lambda_diffusion_ssim * diffusion_ssim_loss
                         loss["total"] = loss["total"] + loss["diffusion_ssim"]
                     else:
                         print("not using diffusion ssim loss")
                     if use_diffusion_l1:
-                        diffusion_l1_loss = l1_loss(vol_pred, diffusion_enhanced_volume)
+                        diffusion_l1_loss = l1_loss(vol_pred_for_diffusion, diffusion_enhanced_volume)
                         loss["diffusion_l1"] = opt.lambda_diffusion_l1 * diffusion_l1_loss
                         loss["total"] = loss["total"] + loss["diffusion_l1"]
                 else:
@@ -469,6 +471,7 @@ def training(
                         diff_tv_vol_sVoxel,
                         pipe,
                     )["vol"]
+                    vol_pred_for_diffusion = normalize_for_slicefixer_domain(vol_pred)
 
                     # 从完整增强体积中提取对应的小体积区域
                     min_bbox_tv = diff_tv_vol_center - diff_tv_vol_sVoxel / 2
@@ -491,15 +494,15 @@ def training(
                         ]
 
                         if FUSED_SSIM_AVAILABLE:
-                            diffusion_ssim, _ = ssim3d(tv_diffusion_enhanced_tensor, vol_pred)
+                            diffusion_ssim, _ = ssim3d(tv_diffusion_enhanced_tensor, vol_pred_for_diffusion)
                         else:
-                            diffusion_ssim, _ = metric_vol_loss(tv_diffusion_enhanced_tensor, vol_pred, "ssim")
+                            diffusion_ssim, _ = metric_vol_loss(tv_diffusion_enhanced_tensor, vol_pred_for_diffusion, "ssim")
                         loss_diffusion_ssim = 1.0 - diffusion_ssim
                         loss["diffusion_ssim"] = opt.lambda_diffusion_ssim * loss_diffusion_ssim
                         loss["total"] = loss["total"] + loss["diffusion_ssim"]
 
                         if use_diffusion_l1:
-                            diffusion_l1_loss = l1_loss(vol_pred, tv_diffusion_enhanced_tensor)
+                            diffusion_l1_loss = l1_loss(vol_pred_for_diffusion, tv_diffusion_enhanced_tensor)
                             loss["diffusion_l1"] = opt.lambda_diffusion_l1 * diffusion_l1_loss
                             loss["total"] = loss["total"] + loss["diffusion_l1"]
                     except Exception as e:
