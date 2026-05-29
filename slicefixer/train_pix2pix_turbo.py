@@ -433,6 +433,17 @@ def main(args):
     else:
         val_overrides = None
 
+    def dataloader_kwargs(num_workers, allow_persistent_workers=True):
+        kwargs = {
+            "num_workers": num_workers,
+            "pin_memory": args.pin_memory,
+        }
+        if num_workers > 0:
+            kwargs["persistent_workers"] = args.persistent_workers and allow_persistent_workers
+            if args.prefetch_factor is not None:
+                kwargs["prefetch_factor"] = args.prefetch_factor
+        return kwargs
+
     dataset_val = MedicalCTDataset(
         case_paths=val_case_paths,
         tokenizer=tokenizer,
@@ -444,7 +455,12 @@ def main(args):
     if val_sample_count == 0:
         raise ValueError("Validation split contains no readable volume slices.")
     dataset_val = torch.utils.data.Subset(dataset_val, range(val_sample_count))
-    dl_val = torch.utils.data.DataLoader(dataset_val, batch_size=1, shuffle=False, num_workers=0)
+    dl_val = torch.utils.data.DataLoader(
+        dataset_val,
+        batch_size=1,
+        shuffle=False,
+        **dataloader_kwargs(args.val_dataloader_num_workers),
+    )
 
     def build_train_dataloader(case_paths, volume_path_overrides=None):
         dataset = MedicalCTDataset(
@@ -458,7 +474,10 @@ def main(args):
             dataset,
             batch_size=args.train_batch_size,
             shuffle=True,
-            num_workers=args.dataloader_num_workers,
+            **dataloader_kwargs(
+                args.dataloader_num_workers,
+                allow_persistent_workers=not use_volume_cache,
+            ),
         )
         return accelerator.prepare(dataloader)
 
@@ -531,6 +550,19 @@ def main(args):
                 shuffle=False, seed=0, batch_size=8, device=torch.device("cuda"),
                 mode="clean", custom_image_tranform=fn_transform, description="", verbose=True)
 
+    constant_prompt_tokens = tokenizer(
+        prompt,
+        max_length=tokenizer.model_max_length,
+        padding="max_length",
+        truncation=True,
+        return_tensors="pt",
+    ).input_ids.cuda()
+    constant_clip_tokens = (
+        clip.tokenize([prompt], truncate=True).cuda()
+        if args.lambda_clipsim > 0
+        else None
+    )
+
     effective_batch_size = (
         accelerator.num_processes
         * args.train_batch_size
@@ -586,15 +618,16 @@ def main(args):
         for step, batch in enumerate(iter_epoch_batches(epoch)):
             l_acc = [net_pix2pix, net_disc]
             with accelerator.accumulate(*l_acc):
-                x_src = batch["conditioning_pixel_values"].cuda()
-                x_tgt = batch["output_pixel_values"].cuda()
-                xray_feat1 = batch["xray_feat1"].cuda() if args.use_xray_conditioning else None
-                xray_feat2 = batch["xray_feat2"].cuda() if args.use_xray_conditioning else None
+                x_src = batch["conditioning_pixel_values"].cuda(non_blocking=True)
+                x_tgt = batch["output_pixel_values"].cuda(non_blocking=True)
+                xray_feat1 = batch["xray_feat1"].cuda(non_blocking=True) if args.use_xray_conditioning else None
+                xray_feat2 = batch["xray_feat2"].cuda(non_blocking=True) if args.use_xray_conditioning else None
                 B, C, H, W = x_src.shape
+                prompt_tokens = constant_prompt_tokens.expand(B, -1)
                 # forward pass
                 x_tgt_pred = net_pix2pix(
                     x_src,
-                    prompt_tokens=batch["input_ids"],
+                    prompt_tokens=prompt_tokens,
                     xray_feat1=xray_feat1,
                     xray_feat2=xray_feat2,
                     deterministic=True,
@@ -613,7 +646,7 @@ def main(args):
                         mode="bilinear",
                         align_corners=False,
                     )
-                    caption_tokens = clip.tokenize(batch["caption"], truncate=True).to(x_tgt_pred.device)
+                    caption_tokens = constant_clip_tokens.expand(B, -1)
                     clipsim, _ = net_clip(x_tgt_pred_renorm, caption_tokens)
                     loss_clipsim = (1 - clipsim.mean() / 100) * args.lambda_clipsim
 
@@ -740,13 +773,14 @@ def main(args):
                     net_pix2pix.eval()
                     with torch.inference_mode():
                         for val_step, batch_val in enumerate(dl_val):
-                            val_src = batch_val["conditioning_pixel_values"].cuda()
-                            val_tgt = batch_val["output_pixel_values"].cuda()
-                            val_xray_feat1 = batch_val["xray_feat1"].cuda() if args.use_xray_conditioning else None
-                            val_xray_feat2 = batch_val["xray_feat2"].cuda() if args.use_xray_conditioning else None
+                            val_src = batch_val["conditioning_pixel_values"].cuda(non_blocking=True)
+                            val_tgt = batch_val["output_pixel_values"].cuda(non_blocking=True)
+                            val_xray_feat1 = batch_val["xray_feat1"].cuda(non_blocking=True) if args.use_xray_conditioning else None
+                            val_xray_feat2 = batch_val["xray_feat2"].cuda(non_blocking=True) if args.use_xray_conditioning else None
+                            val_prompt_tokens = constant_prompt_tokens.expand(val_src.shape[0], -1)
                             val_pred = net_pix2pix(
                                 val_src,
-                                prompt_tokens=batch_val["input_ids"].cuda(),
+                                prompt_tokens=val_prompt_tokens,
                                 xray_feat1=val_xray_feat1,
                                 xray_feat2=val_xray_feat2,
                                 deterministic=True,
@@ -763,9 +797,7 @@ def main(args):
                                 pred_renorm = F.interpolate(
                                     pred_renorm, (224, 224), mode="bilinear", align_corners=False
                                 )
-                                caption_tokens = clip.tokenize(
-                                    batch_val["caption"], truncate=True
-                                ).to(val_pred.device)
+                                caption_tokens = constant_clip_tokens.expand(val_src.shape[0], -1)
                                 clipsim, _ = net_clip(pred_renorm, caption_tokens)
                                 metric_values.append(clipsim.mean())
                             local_metrics.append(torch.stack(metric_values))
