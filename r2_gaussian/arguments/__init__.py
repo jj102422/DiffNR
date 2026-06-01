@@ -70,8 +70,12 @@ class OptimizationParams(ParamGroup):
         self.max_scale = None  # percent of volume size
         self.max_num_gaussians = 500_000
         self.lambda_diffusion_ssim = 1.0 # weight for GEM, default 1
-        self.lambda_diffusion_l1 = 0 
+        self.lambda_diffusion_l1 = 0
         self.diffusion_tv_size = 0
+        self.diffusion_parallel_mode = "none"
+        self.diffusion_start_iter = 10000
+        self.diffusion_slab_halo = 5
+        self.diffusion_cache_path = ""
         super().__init__(parser, "Optimization Parameters")
 
 

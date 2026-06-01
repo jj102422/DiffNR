@@ -4,11 +4,13 @@ from pathlib import Path
 
 # 1. 设置输入与输出路径
 base_dir = Path(
-    "/home/public/CTSpine1K/data/data-MHD_ctpro_woMask1/volume-covid19-A-0382_ct/"
+    "/root/epfs/test/slicefixer_postprocess_stage3_ssim05_l1zero_iter12000/"
 )
 npy_files = [
-    base_dir / "vol_pred.npy",
-    base_dir / "volume_gt.npy",
+    base_dir / "input_stage3_ssim05_l1zero_iter12000.npy",
+    base_dir / "input_stage3_ssim05_l1zero_iter12000_clipped.npy",
+    base_dir / "vol_pred_slicefixer_postprocess.npy",
+    
 ]
 
 # 2. 逐个转换
