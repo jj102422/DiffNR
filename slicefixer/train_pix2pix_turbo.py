@@ -131,6 +131,14 @@ def _npz_key(path):
         return stem if stem in data.files else data.files[0]
 
 
+def _load_array_file(path, key=None):
+    if path.endswith(".npz"):
+        with np.load(path) as data:
+            array_key = key or (Path(path).stem if Path(path).stem in data.files else data.files[0])
+            return data[array_key]
+    return np.load(path)
+
+
 def get_volume_info(path):
     if path.endswith(".npz"):
         key = _npz_key(path)
@@ -145,6 +153,15 @@ def get_volume_info(path):
 
     arr = np.load(path, mmap_mode="r")
     return arr.shape, arr.dtype, None
+
+
+def _slice_files(slice_dir):
+    paths = {}
+    for suffix in ("*.npz", "*.npy"):
+        for path in Path(slice_dir).glob(suffix):
+            if path.is_file():
+                paths[path.name] = str(path)
+    return paths
 
 
 def load_volume_slice(path, slice_idx, key=None, mmap_cache=None):
@@ -188,6 +205,52 @@ class MedicalCTDataset(torch.utils.data.Dataset):
         self.volume_path_overrides = volume_path_overrides or {}
 
         for case_path in self.case_paths:
+            case_name = os.path.basename(case_path.rstrip(os.sep))
+            case_conditioning = {}
+            if self.use_xray_conditioning:
+                xray_path1 = os.path.join(case_path, f"{case_name}_xray_1.pt")
+                xray_path2 = os.path.join(case_path, f"{case_name}_xray_2.pt")
+                if not os.path.exists(xray_path1) or not os.path.exists(xray_path2):
+                    continue
+                xray_feat1 = torch.load(xray_path1, map_location="cpu").float()
+                xray_feat2 = torch.load(xray_path2, map_location="cpu").float()
+                if tuple(xray_feat1.shape) != (1, 768) or tuple(xray_feat2.shape) != (1, 768):
+                    raise ValueError(
+                        f"Expected RAD-DINO CLS features [1, 768] for {case_name}; "
+                        f"got {tuple(xray_feat1.shape)} and {tuple(xray_feat2.shape)}. "
+                        "Run scripts/extract_rad_dino_xray_features.py first."
+                    )
+                case_conditioning["xray_feat1"] = xray_feat1
+                case_conditioning["xray_feat2"] = xray_feat2
+            self._volume_info[case_path] = case_conditioning
+
+            pred_dir = os.path.join(case_path, "pred")
+            gt_dir = os.path.join(case_path, "gt")
+            if os.path.isdir(pred_dir) and os.path.isdir(gt_dir):
+                pred_files = _slice_files(pred_dir)
+                gt_files = _slice_files(gt_dir)
+                for slice_name in sorted(set(pred_files) & set(gt_files)):
+                    coarse_path = pred_files[slice_name]
+                    gt_path = gt_files[slice_name]
+                    coarse_shape, _, coarse_key = get_volume_info(coarse_path)
+                    gt_shape, _, gt_key = get_volume_info(gt_path)
+                    if len(coarse_shape) != 2 or len(gt_shape) != 2:
+                        continue
+                    if coarse_shape != gt_shape:
+                        continue
+                    self.index_map.append(
+                        {
+                            "case_path": case_path,
+                            "mode": "slice",
+                            "coarse_path": coarse_path,
+                            "coarse_key": coarse_key,
+                            "gt_path": gt_path,
+                            "gt_key": gt_key,
+                            "slice_name": slice_name,
+                        }
+                    )
+                continue
+
             override = self.volume_path_overrides.get(str(case_path), {})
             coarse_path = override.get("coarse_path")
             gt_path = override.get("gt_path")
@@ -205,7 +268,6 @@ class MedicalCTDataset(torch.utils.data.Dataset):
                     os.path.join(case_path, "vol_gt.npy"),
                 ]
                 gt_path = next((p for p in gt_candidates if os.path.exists(p)), None)
-            case_name = os.path.basename(case_path.rstrip(os.sep))
             if coarse_path is None or gt_path is None:
                 continue
 
@@ -215,52 +277,45 @@ class MedicalCTDataset(torch.utils.data.Dataset):
                 continue
             if coarse_shape != gt_shape:
                 continue
-            volume_info = {
-                "coarse_path": coarse_path,
-                "coarse_key": coarse_key,
-                "gt_path": gt_path,
-                "gt_key": gt_key,
-            }
-            if self.use_xray_conditioning:
-                xray_path1 = os.path.join(case_path, f"{case_name}_xray_1.pt")
-                xray_path2 = os.path.join(case_path, f"{case_name}_xray_2.pt")
-                if not os.path.exists(xray_path1) or not os.path.exists(xray_path2):
-                    continue
-                xray_feat1 = torch.load(xray_path1, map_location="cpu").float()
-                xray_feat2 = torch.load(xray_path2, map_location="cpu").float()
-                if tuple(xray_feat1.shape) != (1, 768) or tuple(xray_feat2.shape) != (1, 768):
-                    raise ValueError(
-                        f"Expected RAD-DINO CLS features [1, 768] for {case_name}; "
-                        f"got {tuple(xray_feat1.shape)} and {tuple(xray_feat2.shape)}. "
-                        "Run scripts/extract_rad_dino_xray_features.py first."
-                    )
-                volume_info["xray_feat1"] = xray_feat1
-                volume_info["xray_feat2"] = xray_feat2
-            self._volume_info[case_path] = volume_info
             # 这里的 volume_gt.npy / vol_pred.npy 已经在数据生成阶段转成 XYZ 顺序，
             # 因此 axis 2 才是 axial 方向；索引范围也要跟着改成 shape[2]。
             for slice_idx in range(coarse_shape[2]):
-                self.index_map.append((case_path, slice_idx))
+                self.index_map.append(
+                    {
+                        "case_path": case_path,
+                        "mode": "volume",
+                        "coarse_path": coarse_path,
+                        "coarse_key": coarse_key,
+                        "gt_path": gt_path,
+                        "gt_key": gt_key,
+                        "slice_idx": slice_idx,
+                    }
+                )
 
     def __len__(self):
         return len(self.index_map)
 
     def __getitem__(self, idx):
-        case_path, slice_idx = self.index_map[idx]
+        sample_info = self.index_map[idx]
+        case_path = sample_info["case_path"]
         volume_info = self._volume_info[case_path]
-        # axial slice：axis 2 对应 Z 方向，因此这里沿最后一个维度取切片。
-        coarse_slice = load_volume_slice(
-            volume_info["coarse_path"],
-            slice_idx,
-            volume_info["coarse_key"],
-            self._mmap_cache,
-        )
-        gt_slice = load_volume_slice(
-            volume_info["gt_path"],
-            slice_idx,
-            volume_info["gt_key"],
-            self._mmap_cache,
-        )
+        if sample_info["mode"] == "slice":
+            coarse_slice = _load_array_file(sample_info["coarse_path"], sample_info["coarse_key"])
+            gt_slice = _load_array_file(sample_info["gt_path"], sample_info["gt_key"])
+        else:
+            # axial slice：axis 2 对应 Z 方向，因此这里沿最后一个维度取切片。
+            coarse_slice = load_volume_slice(
+                sample_info["coarse_path"],
+                sample_info["slice_idx"],
+                sample_info["coarse_key"],
+                self._mmap_cache,
+            )
+            gt_slice = load_volume_slice(
+                sample_info["gt_path"],
+                sample_info["slice_idx"],
+                sample_info["gt_key"],
+                self._mmap_cache,
+            )
 
         # 这里需要 copy 一份，避免 mmap 读出的只读 numpy 数组直接转 tensor 时触发警告。
         coarse_v = torch.from_numpy(coarse_slice.copy()).float().unsqueeze(0)
