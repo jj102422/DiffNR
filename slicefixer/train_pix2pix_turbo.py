@@ -85,6 +85,12 @@ def make_conditional_disc_input(x_src, x_img):
     return torch.cat([x_src, x_img], dim=1)
 
 
+def make_disc_input(args, x_src, x_img):
+    if args.disable_conditional_gan:
+        return x_img
+    return make_conditional_disc_input(x_src, x_img)
+
+
 def normalize_to_255(img):
     # Visualization only: model tensors are in s-domain, where background is -1.
     img = img.detach().cpu().float()
@@ -123,6 +129,11 @@ def unique_parameters(params):
         seen.add(param_id)
         unique.append(param)
     return unique
+
+
+def set_parameters_requires_grad(params, requires_grad):
+    for param in params:
+        param.requires_grad_(requires_grad)
 
 
 def _npz_key(path):
@@ -387,7 +398,7 @@ def main(args):
     if args.gan_disc_type == "vagan_clip":
         import vision_aided_loss
         base_disc = vision_aided_loss.Discriminator(cv_type='clip', loss_type=args.gan_loss_type, device="cuda")
-        net_disc = ConditionalDiscriminator(base_disc)
+        net_disc = base_disc if args.disable_conditional_gan else ConditionalDiscriminator(base_disc)
     else:
         raise NotImplementedError(f"Discriminator type {args.gan_disc_type} not implemented")
 
@@ -544,6 +555,7 @@ def main(args):
     net_pix2pix, net_disc, optimizer, optimizer_disc, lr_scheduler, lr_scheduler_disc = accelerator.prepare(
         net_pix2pix, net_disc, optimizer, optimizer_disc, lr_scheduler, lr_scheduler_disc
     )
+    disc_trainable_params = [param for param in net_disc.parameters() if param.requires_grad]
     dl_val = accelerator.prepare(dl_val)
     net_lpips = accelerator.prepare(net_lpips)
     if net_clip is not None:
@@ -715,8 +727,16 @@ def main(args):
                 # GAN loss for generator
                 loss_gan = torch.tensor(0.0, device=x_tgt_pred.device)
                 if gan_enabled:
-                    fake_pair_for_g = make_conditional_disc_input(x_src, x_tgt_pred)
-                    loss_gan = net_disc(fake_pair_for_g, for_G=True).mean() * args.lambda_gan
+                    if args.disable_conditional_gan:
+                        set_parameters_requires_grad(disc_trainable_params, False)
+                        try:
+                            fake_for_g = make_disc_input(args, x_src, x_tgt_pred)
+                            loss_gan = net_disc(fake_for_g, for_G=True).mean() * args.lambda_gan
+                        finally:
+                            set_parameters_requires_grad(disc_trainable_params, True)
+                    else:
+                        fake_for_g = make_disc_input(args, x_src, x_tgt_pred)
+                        loss_gan = net_disc(fake_for_g, for_G=True).mean() * args.lambda_gan
 
                 # Total generator loss (paper formula)
                 loss = loss_l2 + loss_lpips + loss_clipsim + loss_gan + loss_ssim
@@ -745,13 +765,22 @@ def main(args):
                 lossD = torch.tensor(0.0, device=x_tgt_pred.device)
                 if gan_enabled:
                     optimizer_disc.zero_grad(set_to_none=args.set_grads_to_none)
-                    real_pair = make_conditional_disc_input(x_src.detach(), x_tgt.detach())
-                    fake_pair = make_conditional_disc_input(x_src.detach(), x_tgt_pred.detach())
-                    lossD_real = net_disc(real_pair, for_real=True).mean() * args.lambda_gan
-                    lossD_fake = net_disc(fake_pair, for_real=False).mean() * args.lambda_gan
+                    if args.disable_conditional_gan:
+                        real_for_d = make_disc_input(args, x_src.detach(), x_tgt.detach())
+                        lossD_real = net_disc(real_for_d, for_real=True).mean() * args.lambda_gan
+                        accelerator.backward(lossD_real)
 
-                    lossD = lossD_real + lossD_fake
-                    accelerator.backward(lossD)
+                        fake_for_d = make_disc_input(args, x_src.detach(), x_tgt_pred.detach())
+                        lossD_fake = net_disc(fake_for_d, for_real=False).mean() * args.lambda_gan
+                        accelerator.backward(lossD_fake)
+                    else:
+                        real_for_d = make_disc_input(args, x_src.detach(), x_tgt.detach())
+                        fake_for_d = make_disc_input(args, x_src.detach(), x_tgt_pred.detach())
+                        lossD_real = net_disc(real_for_d, for_real=True).mean() * args.lambda_gan
+                        lossD_fake = net_disc(fake_for_d, for_real=False).mean() * args.lambda_gan
+                        lossD = lossD_real + lossD_fake
+                        accelerator.backward(lossD)
+                    lossD = lossD_real.detach() + lossD_fake.detach()
 
                     # [修复 NaN 错误] 同样重新启用判别器的梯度裁剪，控制判别器的更新幅度
                     if accelerator.sync_gradients:

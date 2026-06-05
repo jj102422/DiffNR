@@ -32,6 +32,11 @@ def parse_args_paired_training(input_args=None):
         type=int,
         help="Number of optimizer steps to train without adversarial loss before enabling GAN.",
     )
+    parser.add_argument(
+        "--disable_conditional_gan",
+        action="store_true",
+        help="Use the base image discriminator instead of conditioning GAN D on input/target pairs.",
+    )
 
     # dataset options
     parser.add_argument("--dataset_folder", required=True, type=str)
