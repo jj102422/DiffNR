@@ -85,6 +85,12 @@ def make_conditional_disc_input(x_src, x_img):
     return torch.cat([x_src, x_img], dim=1)
 
 
+def make_disc_input(args, x_src, x_img):
+    if args.disable_conditional_gan:
+        return x_img
+    return make_conditional_disc_input(x_src, x_img)
+
+
 def normalize_to_255(img):
     # Visualization only: model tensors are in s-domain, where background is -1.
     img = img.detach().cpu().float()
@@ -125,10 +131,23 @@ def unique_parameters(params):
     return unique
 
 
+def set_parameters_requires_grad(params, requires_grad):
+    for param in params:
+        param.requires_grad_(requires_grad)
+
+
 def _npz_key(path):
     stem = Path(path).stem
     with np.load(path) as data:
         return stem if stem in data.files else data.files[0]
+
+
+def _load_array_file(path, key=None):
+    if path.endswith(".npz"):
+        with np.load(path) as data:
+            array_key = key or (Path(path).stem if Path(path).stem in data.files else data.files[0])
+            return data[array_key]
+    return np.load(path)
 
 
 def get_volume_info(path):
@@ -145,6 +164,15 @@ def get_volume_info(path):
 
     arr = np.load(path, mmap_mode="r")
     return arr.shape, arr.dtype, None
+
+
+def _slice_files(slice_dir):
+    paths = {}
+    for suffix in ("*.npz", "*.npy"):
+        for path in Path(slice_dir).glob(suffix):
+            if path.is_file():
+                paths[path.name] = str(path)
+    return paths
 
 
 def load_volume_slice(path, slice_idx, key=None, mmap_cache=None):
@@ -188,6 +216,52 @@ class MedicalCTDataset(torch.utils.data.Dataset):
         self.volume_path_overrides = volume_path_overrides or {}
 
         for case_path in self.case_paths:
+            case_name = os.path.basename(case_path.rstrip(os.sep))
+            case_conditioning = {}
+            if self.use_xray_conditioning:
+                xray_path1 = os.path.join(case_path, f"{case_name}_xray_1.pt")
+                xray_path2 = os.path.join(case_path, f"{case_name}_xray_2.pt")
+                if not os.path.exists(xray_path1) or not os.path.exists(xray_path2):
+                    continue
+                xray_feat1 = torch.load(xray_path1, map_location="cpu").float()
+                xray_feat2 = torch.load(xray_path2, map_location="cpu").float()
+                if tuple(xray_feat1.shape) != (1, 768) or tuple(xray_feat2.shape) != (1, 768):
+                    raise ValueError(
+                        f"Expected RAD-DINO CLS features [1, 768] for {case_name}; "
+                        f"got {tuple(xray_feat1.shape)} and {tuple(xray_feat2.shape)}. "
+                        "Run scripts/extract_rad_dino_xray_features.py first."
+                    )
+                case_conditioning["xray_feat1"] = xray_feat1
+                case_conditioning["xray_feat2"] = xray_feat2
+            self._volume_info[case_path] = case_conditioning
+
+            pred_dir = os.path.join(case_path, "pred")
+            gt_dir = os.path.join(case_path, "gt")
+            if os.path.isdir(pred_dir) and os.path.isdir(gt_dir):
+                pred_files = _slice_files(pred_dir)
+                gt_files = _slice_files(gt_dir)
+                for slice_name in sorted(set(pred_files) & set(gt_files)):
+                    coarse_path = pred_files[slice_name]
+                    gt_path = gt_files[slice_name]
+                    coarse_shape, _, coarse_key = get_volume_info(coarse_path)
+                    gt_shape, _, gt_key = get_volume_info(gt_path)
+                    if len(coarse_shape) != 2 or len(gt_shape) != 2:
+                        continue
+                    if coarse_shape != gt_shape:
+                        continue
+                    self.index_map.append(
+                        {
+                            "case_path": case_path,
+                            "mode": "slice",
+                            "coarse_path": coarse_path,
+                            "coarse_key": coarse_key,
+                            "gt_path": gt_path,
+                            "gt_key": gt_key,
+                            "slice_name": slice_name,
+                        }
+                    )
+                continue
+
             override = self.volume_path_overrides.get(str(case_path), {})
             coarse_path = override.get("coarse_path")
             gt_path = override.get("gt_path")
@@ -205,7 +279,6 @@ class MedicalCTDataset(torch.utils.data.Dataset):
                     os.path.join(case_path, "vol_gt.npy"),
                 ]
                 gt_path = next((p for p in gt_candidates if os.path.exists(p)), None)
-            case_name = os.path.basename(case_path.rstrip(os.sep))
             if coarse_path is None or gt_path is None:
                 continue
 
@@ -215,52 +288,45 @@ class MedicalCTDataset(torch.utils.data.Dataset):
                 continue
             if coarse_shape != gt_shape:
                 continue
-            volume_info = {
-                "coarse_path": coarse_path,
-                "coarse_key": coarse_key,
-                "gt_path": gt_path,
-                "gt_key": gt_key,
-            }
-            if self.use_xray_conditioning:
-                xray_path1 = os.path.join(case_path, f"{case_name}_xray_1.pt")
-                xray_path2 = os.path.join(case_path, f"{case_name}_xray_2.pt")
-                if not os.path.exists(xray_path1) or not os.path.exists(xray_path2):
-                    continue
-                xray_feat1 = torch.load(xray_path1, map_location="cpu").float()
-                xray_feat2 = torch.load(xray_path2, map_location="cpu").float()
-                if tuple(xray_feat1.shape) != (1, 768) or tuple(xray_feat2.shape) != (1, 768):
-                    raise ValueError(
-                        f"Expected RAD-DINO CLS features [1, 768] for {case_name}; "
-                        f"got {tuple(xray_feat1.shape)} and {tuple(xray_feat2.shape)}. "
-                        "Run scripts/extract_rad_dino_xray_features.py first."
-                    )
-                volume_info["xray_feat1"] = xray_feat1
-                volume_info["xray_feat2"] = xray_feat2
-            self._volume_info[case_path] = volume_info
             # 这里的 volume_gt.npy / vol_pred.npy 已经在数据生成阶段转成 XYZ 顺序，
             # 因此 axis 2 才是 axial 方向；索引范围也要跟着改成 shape[2]。
             for slice_idx in range(coarse_shape[2]):
-                self.index_map.append((case_path, slice_idx))
+                self.index_map.append(
+                    {
+                        "case_path": case_path,
+                        "mode": "volume",
+                        "coarse_path": coarse_path,
+                        "coarse_key": coarse_key,
+                        "gt_path": gt_path,
+                        "gt_key": gt_key,
+                        "slice_idx": slice_idx,
+                    }
+                )
 
     def __len__(self):
         return len(self.index_map)
 
     def __getitem__(self, idx):
-        case_path, slice_idx = self.index_map[idx]
+        sample_info = self.index_map[idx]
+        case_path = sample_info["case_path"]
         volume_info = self._volume_info[case_path]
-        # axial slice：axis 2 对应 Z 方向，因此这里沿最后一个维度取切片。
-        coarse_slice = load_volume_slice(
-            volume_info["coarse_path"],
-            slice_idx,
-            volume_info["coarse_key"],
-            self._mmap_cache,
-        )
-        gt_slice = load_volume_slice(
-            volume_info["gt_path"],
-            slice_idx,
-            volume_info["gt_key"],
-            self._mmap_cache,
-        )
+        if sample_info["mode"] == "slice":
+            coarse_slice = _load_array_file(sample_info["coarse_path"], sample_info["coarse_key"])
+            gt_slice = _load_array_file(sample_info["gt_path"], sample_info["gt_key"])
+        else:
+            # axial slice：axis 2 对应 Z 方向，因此这里沿最后一个维度取切片。
+            coarse_slice = load_volume_slice(
+                sample_info["coarse_path"],
+                sample_info["slice_idx"],
+                sample_info["coarse_key"],
+                self._mmap_cache,
+            )
+            gt_slice = load_volume_slice(
+                sample_info["gt_path"],
+                sample_info["slice_idx"],
+                sample_info["gt_key"],
+                self._mmap_cache,
+            )
 
         # 这里需要 copy 一份，避免 mmap 读出的只读 numpy 数组直接转 tensor 时触发警告。
         coarse_v = torch.from_numpy(coarse_slice.copy()).float().unsqueeze(0)
@@ -332,7 +398,7 @@ def main(args):
     if args.gan_disc_type == "vagan_clip":
         import vision_aided_loss
         base_disc = vision_aided_loss.Discriminator(cv_type='clip', loss_type=args.gan_loss_type, device="cuda")
-        net_disc = ConditionalDiscriminator(base_disc)
+        net_disc = base_disc if args.disable_conditional_gan else ConditionalDiscriminator(base_disc)
     else:
         raise NotImplementedError(f"Discriminator type {args.gan_disc_type} not implemented")
 
@@ -433,6 +499,17 @@ def main(args):
     else:
         val_overrides = None
 
+    def dataloader_kwargs(num_workers, allow_persistent_workers=True):
+        kwargs = {
+            "num_workers": num_workers,
+            "pin_memory": args.pin_memory,
+        }
+        if num_workers > 0:
+            kwargs["persistent_workers"] = args.persistent_workers and allow_persistent_workers
+            if args.prefetch_factor is not None:
+                kwargs["prefetch_factor"] = args.prefetch_factor
+        return kwargs
+
     dataset_val = MedicalCTDataset(
         case_paths=val_case_paths,
         tokenizer=tokenizer,
@@ -444,7 +521,12 @@ def main(args):
     if val_sample_count == 0:
         raise ValueError("Validation split contains no readable volume slices.")
     dataset_val = torch.utils.data.Subset(dataset_val, range(val_sample_count))
-    dl_val = torch.utils.data.DataLoader(dataset_val, batch_size=1, shuffle=False, num_workers=0)
+    dl_val = torch.utils.data.DataLoader(
+        dataset_val,
+        batch_size=1,
+        shuffle=False,
+        **dataloader_kwargs(args.val_dataloader_num_workers),
+    )
 
     def build_train_dataloader(case_paths, volume_path_overrides=None):
         dataset = MedicalCTDataset(
@@ -458,7 +540,10 @@ def main(args):
             dataset,
             batch_size=args.train_batch_size,
             shuffle=True,
-            num_workers=args.dataloader_num_workers,
+            **dataloader_kwargs(
+                args.dataloader_num_workers,
+                allow_persistent_workers=not use_volume_cache,
+            ),
         )
         return accelerator.prepare(dataloader)
 
@@ -470,6 +555,7 @@ def main(args):
     net_pix2pix, net_disc, optimizer, optimizer_disc, lr_scheduler, lr_scheduler_disc = accelerator.prepare(
         net_pix2pix, net_disc, optimizer, optimizer_disc, lr_scheduler, lr_scheduler_disc
     )
+    disc_trainable_params = [param for param in net_disc.parameters() if param.requires_grad]
     dl_val = accelerator.prepare(dl_val)
     net_lpips = accelerator.prepare(net_lpips)
     if net_clip is not None:
@@ -531,6 +617,19 @@ def main(args):
                 shuffle=False, seed=0, batch_size=8, device=torch.device("cuda"),
                 mode="clean", custom_image_tranform=fn_transform, description="", verbose=True)
 
+    constant_prompt_tokens = tokenizer(
+        prompt,
+        max_length=tokenizer.model_max_length,
+        padding="max_length",
+        truncation=True,
+        return_tensors="pt",
+    ).input_ids.cuda()
+    constant_clip_tokens = (
+        clip.tokenize([prompt], truncate=True).cuda()
+        if args.lambda_clipsim > 0
+        else None
+    )
+
     effective_batch_size = (
         accelerator.num_processes
         * args.train_batch_size
@@ -586,15 +685,16 @@ def main(args):
         for step, batch in enumerate(iter_epoch_batches(epoch)):
             l_acc = [net_pix2pix, net_disc]
             with accelerator.accumulate(*l_acc):
-                x_src = batch["conditioning_pixel_values"].cuda()
-                x_tgt = batch["output_pixel_values"].cuda()
-                xray_feat1 = batch["xray_feat1"].cuda() if args.use_xray_conditioning else None
-                xray_feat2 = batch["xray_feat2"].cuda() if args.use_xray_conditioning else None
+                x_src = batch["conditioning_pixel_values"].cuda(non_blocking=True)
+                x_tgt = batch["output_pixel_values"].cuda(non_blocking=True)
+                xray_feat1 = batch["xray_feat1"].cuda(non_blocking=True) if args.use_xray_conditioning else None
+                xray_feat2 = batch["xray_feat2"].cuda(non_blocking=True) if args.use_xray_conditioning else None
                 B, C, H, W = x_src.shape
+                prompt_tokens = constant_prompt_tokens.expand(B, -1)
                 # forward pass
                 x_tgt_pred = net_pix2pix(
                     x_src,
-                    prompt_tokens=batch["input_ids"],
+                    prompt_tokens=prompt_tokens,
                     xray_feat1=xray_feat1,
                     xray_feat2=xray_feat2,
                     deterministic=True,
@@ -613,7 +713,7 @@ def main(args):
                         mode="bilinear",
                         align_corners=False,
                     )
-                    caption_tokens = clip.tokenize(batch["caption"], truncate=True).to(x_tgt_pred.device)
+                    caption_tokens = constant_clip_tokens.expand(B, -1)
                     clipsim, _ = net_clip(x_tgt_pred_renorm, caption_tokens)
                     loss_clipsim = (1 - clipsim.mean() / 100) * args.lambda_clipsim
 
@@ -627,8 +727,16 @@ def main(args):
                 # GAN loss for generator
                 loss_gan = torch.tensor(0.0, device=x_tgt_pred.device)
                 if gan_enabled:
-                    fake_pair_for_g = make_conditional_disc_input(x_src, x_tgt_pred)
-                    loss_gan = net_disc(fake_pair_for_g, for_G=True).mean() * args.lambda_gan
+                    if args.disable_conditional_gan:
+                        set_parameters_requires_grad(disc_trainable_params, False)
+                        try:
+                            fake_for_g = make_disc_input(args, x_src, x_tgt_pred)
+                            loss_gan = net_disc(fake_for_g, for_G=True).mean() * args.lambda_gan
+                        finally:
+                            set_parameters_requires_grad(disc_trainable_params, True)
+                    else:
+                        fake_for_g = make_disc_input(args, x_src, x_tgt_pred)
+                        loss_gan = net_disc(fake_for_g, for_G=True).mean() * args.lambda_gan
 
                 # Total generator loss (paper formula)
                 loss = loss_l2 + loss_lpips + loss_clipsim + loss_gan + loss_ssim
@@ -657,13 +765,22 @@ def main(args):
                 lossD = torch.tensor(0.0, device=x_tgt_pred.device)
                 if gan_enabled:
                     optimizer_disc.zero_grad(set_to_none=args.set_grads_to_none)
-                    real_pair = make_conditional_disc_input(x_src.detach(), x_tgt.detach())
-                    fake_pair = make_conditional_disc_input(x_src.detach(), x_tgt_pred.detach())
-                    lossD_real = net_disc(real_pair, for_real=True).mean() * args.lambda_gan
-                    lossD_fake = net_disc(fake_pair, for_real=False).mean() * args.lambda_gan
+                    if args.disable_conditional_gan:
+                        real_for_d = make_disc_input(args, x_src.detach(), x_tgt.detach())
+                        lossD_real = net_disc(real_for_d, for_real=True).mean() * args.lambda_gan
+                        accelerator.backward(lossD_real)
 
-                    lossD = lossD_real + lossD_fake
-                    accelerator.backward(lossD)
+                        fake_for_d = make_disc_input(args, x_src.detach(), x_tgt_pred.detach())
+                        lossD_fake = net_disc(fake_for_d, for_real=False).mean() * args.lambda_gan
+                        accelerator.backward(lossD_fake)
+                    else:
+                        real_for_d = make_disc_input(args, x_src.detach(), x_tgt.detach())
+                        fake_for_d = make_disc_input(args, x_src.detach(), x_tgt_pred.detach())
+                        lossD_real = net_disc(real_for_d, for_real=True).mean() * args.lambda_gan
+                        lossD_fake = net_disc(fake_for_d, for_real=False).mean() * args.lambda_gan
+                        lossD = lossD_real + lossD_fake
+                        accelerator.backward(lossD)
+                    lossD = lossD_real.detach() + lossD_fake.detach()
 
                     # [修复 NaN 错误] 同样重新启用判别器的梯度裁剪，控制判别器的更新幅度
                     if accelerator.sync_gradients:
@@ -740,13 +857,14 @@ def main(args):
                     net_pix2pix.eval()
                     with torch.inference_mode():
                         for val_step, batch_val in enumerate(dl_val):
-                            val_src = batch_val["conditioning_pixel_values"].cuda()
-                            val_tgt = batch_val["output_pixel_values"].cuda()
-                            val_xray_feat1 = batch_val["xray_feat1"].cuda() if args.use_xray_conditioning else None
-                            val_xray_feat2 = batch_val["xray_feat2"].cuda() if args.use_xray_conditioning else None
+                            val_src = batch_val["conditioning_pixel_values"].cuda(non_blocking=True)
+                            val_tgt = batch_val["output_pixel_values"].cuda(non_blocking=True)
+                            val_xray_feat1 = batch_val["xray_feat1"].cuda(non_blocking=True) if args.use_xray_conditioning else None
+                            val_xray_feat2 = batch_val["xray_feat2"].cuda(non_blocking=True) if args.use_xray_conditioning else None
+                            val_prompt_tokens = constant_prompt_tokens.expand(val_src.shape[0], -1)
                             val_pred = net_pix2pix(
                                 val_src,
-                                prompt_tokens=batch_val["input_ids"].cuda(),
+                                prompt_tokens=val_prompt_tokens,
                                 xray_feat1=val_xray_feat1,
                                 xray_feat2=val_xray_feat2,
                                 deterministic=True,
@@ -763,9 +881,7 @@ def main(args):
                                 pred_renorm = F.interpolate(
                                     pred_renorm, (224, 224), mode="bilinear", align_corners=False
                                 )
-                                caption_tokens = clip.tokenize(
-                                    batch_val["caption"], truncate=True
-                                ).to(val_pred.device)
+                                caption_tokens = constant_clip_tokens.expand(val_src.shape[0], -1)
                                 clipsim, _ = net_clip(pred_renorm, caption_tokens)
                                 metric_values.append(clipsim.mean())
                             local_metrics.append(torch.stack(metric_values))

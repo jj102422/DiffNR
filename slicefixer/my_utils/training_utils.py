@@ -32,6 +32,11 @@ def parse_args_paired_training(input_args=None):
         type=int,
         help="Number of optimizer steps to train without adversarial loss before enabling GAN.",
     )
+    parser.add_argument(
+        "--disable_conditional_gan",
+        action="store_true",
+        help="Use the base image discriminator instead of conditioning GAN D on input/target pairs.",
+    )
 
     # dataset options
     parser.add_argument("--dataset_folder", required=True, type=str)
@@ -123,6 +128,28 @@ def parse_args_paired_training(input_args=None):
     parser.add_argument("--lr_power", type=float, default=1.0, help="Power factor of the polynomial scheduler.")
 
     parser.add_argument("--dataloader_num_workers", type=int, default=0,)
+    parser.add_argument(
+        "--val_dataloader_num_workers",
+        type=int,
+        default=0,
+        help="Number of validation DataLoader workers. Defaults to 0 for compatibility.",
+    )
+    parser.add_argument(
+        "--pin_memory",
+        action="store_true",
+        help="Enable pinned host memory for train/validation DataLoaders.",
+    )
+    parser.add_argument(
+        "--persistent_workers",
+        action="store_true",
+        help="Keep DataLoader workers alive between epochs/cache blocks when num_workers > 0.",
+    )
+    parser.add_argument(
+        "--prefetch_factor",
+        type=int,
+        default=None,
+        help="Number of batches prefetched by each DataLoader worker. Only used when num_workers > 0.",
+    )
     parser.add_argument("--adam_beta1", type=float, default=0.9, help="The beta1 parameter for the Adam optimizer.")
     parser.add_argument("--adam_beta2", type=float, default=0.999, help="The beta2 parameter for the Adam optimizer.")
     parser.add_argument("--adam_weight_decay", type=float, default=1e-2, help="Weight decay to use.")
