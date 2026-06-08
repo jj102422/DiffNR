@@ -701,7 +701,9 @@ def main(args):
                 )
                 # Reconstruction loss
                 loss_l2 = F.mse_loss(x_tgt_pred.float(), x_tgt.float(), reduction="mean") * args.lambda_l2
-                loss_lpips = net_lpips(x_tgt_pred.float(), x_tgt.float()).mean() * args.lambda_lpips
+                loss_lpips = torch.tensor(0.0, device=x_tgt_pred.device)
+                if args.lambda_lpips > 0:
+                    loss_lpips = net_lpips(x_tgt_pred.float(), x_tgt.float()).mean() * args.lambda_lpips
 
                 # CLIP alignment loss
                 loss_clipsim = torch.tensor(0.0, device=x_tgt_pred.device)
