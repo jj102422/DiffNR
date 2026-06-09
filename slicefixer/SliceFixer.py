@@ -50,8 +50,13 @@ class SliceFixer(torch.nn.Module):
         lora_rank_vae=4,
         sd_turbo_path=None,
         use_xray_conditioning=False,
+        conditioning_in_channels=3,
     ):
         super().__init__()
+        loaded_sd = torch.load(pretrained_path, map_location="cpu") if pretrained_path is not None else None
+        if loaded_sd is not None and conditioning_in_channels is None:
+            conditioning_in_channels = loaded_sd.get("conditioning_in_channels", 3)
+        self.conditioning_in_channels = int(conditioning_in_channels or 3)
         self.use_xray_conditioning = use_xray_conditioning
         self.sd_turbo_path = (
             sd_turbo_path
@@ -73,6 +78,7 @@ class SliceFixer(torch.nn.Module):
         ).cuda()
         
         self.fusion_adapter = CrossAttnFusionAdapter(text_dim=1024, xray_dim=768, num_heads=8).cuda()
+        self.input_adapter = self._make_input_adapter(self.conditioning_in_channels)
         self.sched = make_1step_sched(self.sd_turbo_path, local_files_only)
         
         vae = AutoencoderKL.from_pretrained(
@@ -164,7 +170,7 @@ class SliceFixer(torch.nn.Module):
             unet.load_state_dict(_sd_unet)
 
         elif pretrained_path is not None:
-            sd = torch.load(pretrained_path, map_location="cpu")
+            sd = loaded_sd
             self.use_xray_conditioning = sd.get("use_xray_conditioning", True)
             if self.use_xray_conditioning and "state_dict_fusion_adapter" not in sd:
                 raise ValueError(
@@ -189,6 +195,19 @@ class SliceFixer(torch.nn.Module):
             unet.load_state_dict(_sd_unet)
             if self.use_xray_conditioning:
                 self.fusion_adapter.load_state_dict(sd["state_dict_fusion_adapter"])
+            if "state_dict_input_adapter" in sd:
+                checkpoint_channels = int(sd.get("conditioning_in_channels", 3))
+                if checkpoint_channels != self.conditioning_in_channels:
+                    raise ValueError(
+                        f"Checkpoint was trained with {checkpoint_channels} conditioning channels, "
+                        f"but this run requested {self.conditioning_in_channels}."
+                    )
+                self.input_adapter.load_state_dict(sd["state_dict_input_adapter"])
+            elif self.conditioning_in_channels != 3:
+                print(
+                    f"Initializing {self.conditioning_in_channels}->3 input adapter from center slice; "
+                    "new context/mask channels are ignored until this adapter is fine-tuned."
+                )
             self.lora_rank_unet = sd["rank_unet"]
             self.lora_rank_vae = sd["rank_vae"]
             self.target_modules_vae = sd["vae_lora_target_modules"]
@@ -228,6 +247,18 @@ class SliceFixer(torch.nn.Module):
         self.timesteps = torch.tensor([999], device="cuda").long() # difix3D used 199
         self.text_encoder.requires_grad_(False)
 
+    def _make_input_adapter(self, in_channels):
+        if in_channels == 3:
+            return torch.nn.Identity()
+        adapter = torch.nn.Conv2d(in_channels, 3, kernel_size=1, bias=False).cuda()
+        with torch.no_grad():
+            adapter.weight.zero_()
+            slice_channels = in_channels // 2 if in_channels > 1 and in_channels % 2 == 0 else in_channels
+            center_channel = slice_channels // 2
+            for out_channel in range(3):
+                adapter.weight[out_channel, center_channel, 0, 0] = 1.0
+        return adapter
+
     def set_eval(self):
         self.unet.eval()
         self.vae.eval()
@@ -235,6 +266,8 @@ class SliceFixer(torch.nn.Module):
         self.vae.requires_grad_(False)
         self.fusion_adapter.eval()
         self.fusion_adapter.requires_grad_(False)
+        self.input_adapter.eval()
+        self.input_adapter.requires_grad_(False)
 
     def set_train(self):
         self.unet.train()
@@ -257,6 +290,8 @@ class SliceFixer(torch.nn.Module):
         else:
             self.fusion_adapter.eval()
             self.fusion_adapter.requires_grad_(False)
+        self.input_adapter.train()
+        self.input_adapter.requires_grad_(True)
 
     def forward(self, c_t, prompt=None, prompt_tokens=None, deterministic=True, r=1.0, noise_map=None, xray_feat1=None, xray_feat2=None):
         # either the prompt or the prompt_tokens should be provided
@@ -277,6 +312,12 @@ class SliceFixer(torch.nn.Module):
             xray_feats = xray_feats.to(caption_enc.device, dtype=caption_enc.dtype)
             caption_enc = self.fusion_adapter(caption_enc, xray_feats)
         if deterministic:
+            if c_t.shape[1] != self.conditioning_in_channels:
+                raise ValueError(
+                    f"SliceFixer expected {self.conditioning_in_channels} conditioning channels, "
+                    f"got {c_t.shape[1]}."
+                )
+            c_t = self.input_adapter(c_t)
             encoded_control = self.vae.encode(c_t).latent_dist.sample() * self.vae.config.scaling_factor
             model_pred = self.unet(encoded_control, self.timesteps, encoder_hidden_states=caption_enc,).sample
             x_denoised = self.sched.step(model_pred, self.timesteps, encoded_control, return_dict=True).prev_sample
@@ -284,6 +325,12 @@ class SliceFixer(torch.nn.Module):
             self.vae.decoder.incoming_skip_acts = self.vae.encoder.current_down_blocks
             output_image = self.vae.decode(x_denoised / self.vae.config.scaling_factor).sample.clamp(-1.0, 1.0)
         else:
+            if c_t.shape[1] != self.conditioning_in_channels:
+                raise ValueError(
+                    f"SliceFixer expected {self.conditioning_in_channels} conditioning channels, "
+                    f"got {c_t.shape[1]}."
+                )
+            c_t = self.input_adapter(c_t)
             # scale the lora weights based on the r value
             self.unet.set_adapters(["default"], weights=[r])
             set_weights_and_activate_adapters(self.vae, ["vae_skip"], [r])
@@ -308,6 +355,9 @@ class SliceFixer(torch.nn.Module):
         sd["rank_vae"] = self.lora_rank_vae
         sd["state_dict_unet"] = {k: v for k, v in self.unet.state_dict().items() if "lora" in k or "conv_in" in k}
         sd["state_dict_vae"] = {k: v for k, v in self.vae.state_dict().items() if "lora" in k or "skip" in k}
+        sd["conditioning_in_channels"] = self.conditioning_in_channels
+        if not isinstance(self.input_adapter, torch.nn.Identity):
+            sd["state_dict_input_adapter"] = self.input_adapter.state_dict()
         sd["use_xray_conditioning"] = self.use_xray_conditioning
         if self.use_xray_conditioning:
             sd["state_dict_fusion_adapter"] = self.fusion_adapter.state_dict()

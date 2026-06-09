@@ -11,17 +11,21 @@ if [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
   set -u
 fi
 
-CASE_ID="1.3.6.1.4.1.9328.50.4.0001"
-RUN_NAME="SliceFixer_0001_rad_dino_cache8_noclip_l2x2_gan01_lr1e5_4gpu_bs1_acc4_eb16_eval500_val100_uncondgan"
+CASE_ID=${CASE_ID-"1.3.6.1.4.1.9328.50.4.0001"}
+RUN_NAME=${RUN_NAME-"SliceFixer_0001_rad_dino_2p5d_spinemask_fromscratch_cache8_noclip_l2x2_gan01_lr1e5_8gpu_bs1_acc4_eb16_eval500_val100_uncondgan"}
 
 DATASET_ROOT=${DATASET_ROOT-/root/epfs/data}
 INFO_JSON=${INFO_JSON-/root/epfs/DiffNR/info_slicefixer_0001.json}
 OUTPUT_DIR=${OUTPUT_DIR-/root/epfs/DiffNR/outputs/$RUN_NAME}
 SD_TURBO_PATH=${SD_TURBO_PATH-/root/epfs/sd-turbo}
-SLICEFIXER_PRETRAINED_PATH=${SLICEFIXER_PRETRAINED_PATH-/root/epfs/DiffNR/outputs/SliceFixer_mixed_organs_rad_dino_cache8_noclip_l2x2_gan01_lr1e5_4gpu_bs1_acc4_eb16_eval500_val100/checkpoints/model_70001.pkl}
-INITIAL_GLOBAL_STEP=${INITIAL_GLOBAL_STEP-70001}
-NPROC_PER_NODE=${NPROC_PER_NODE-4}
+SLICEFIXER_PRETRAINED_PATH=${SLICEFIXER_PRETRAINED_PATH-}
+INITIAL_GLOBAL_STEP=${INITIAL_GLOBAL_STEP-0}
+NPROC_PER_NODE=${NPROC_PER_NODE-8}
 MAIN_PROCESS_PORT=${MAIN_PROCESS_PORT-29501}
+SLICE_CONTEXT_RADIUS=${SLICE_CONTEXT_RADIUS-2}
+USE_MASK_CONDITIONING=${USE_MASK_CONDITIONING-1}
+REQUIRE_MASK_CONDITIONING=${REQUIRE_MASK_CONDITIONING-1}
+MASK_RELPATH=${MASK_RELPATH-mask/ct_file.mha}
 export WANDB_MODE=${WANDB_MODE-online}
 
 if [ ! -d "$DATASET_ROOT/$CASE_ID/gt" ] || [ ! -d "$DATASET_ROOT/$CASE_ID/pred" ]; then
@@ -47,6 +51,19 @@ if [ -n "$SLICEFIXER_PRETRAINED_PATH" ]; then
     --slicefixer_pretrained_path "$SLICEFIXER_PRETRAINED_PATH"
     --initial_global_step "$INITIAL_GLOBAL_STEP"
   )
+fi
+
+conditioning_args=(
+  --slice_context_radius "$SLICE_CONTEXT_RADIUS"
+)
+if [ "$USE_MASK_CONDITIONING" = "1" ]; then
+  conditioning_args+=(
+    --use_mask_conditioning
+    --mask_relpath "$MASK_RELPATH"
+  )
+fi
+if [ "$REQUIRE_MASK_CONDITIONING" = "1" ]; then
+  conditioning_args+=(--require_mask_conditioning)
 fi
 
 accelerate launch \
@@ -83,4 +100,5 @@ accelerate launch \
   --tracker_project_name Slicefixer \
   --tracker_run_name "$RUN_NAME" \
   --disable_conditional_gan \
+  "${conditioning_args[@]}" \
   "${resume_args[@]}"

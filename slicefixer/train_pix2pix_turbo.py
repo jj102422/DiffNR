@@ -31,6 +31,14 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(REPO_ROOT / "slicefixer")) # 确保能索引到 DiffNR 里的 slicefixer 模块
 from SliceFixer import SliceFixer
+from conditioning_utils import (
+    axial_slice_index,
+    build_context_stack,
+    build_context_stack_from_indices,
+    context_channel_count,
+    clamped_context_indices,
+    load_mask_volume,
+)
 from intensity_utils import volume_to_slicefixer
 from my_utils.training_utils import parse_args_paired_training
 from volume_cache import TemporaryVolumeCache
@@ -55,22 +63,23 @@ def ssim_loss_and_value(pred, target):
 
 
 class ConditionalDiscriminator(nn.Module):
-    def __init__(self, discriminator, in_channels=6, image_channels=3):
+    def __init__(self, discriminator, condition_channels=3, image_channels=3):
         super().__init__()
+        in_channels = condition_channels + image_channels
         self.base_discriminator = discriminator
         self.condition_adapter = nn.Conv2d(in_channels, image_channels, kernel_size=1)
-        self._init_as_target_passthrough(image_channels)
+        self._init_as_target_passthrough(condition_channels, image_channels)
 
     @property
     def cv_ensemble(self):
         return self.base_discriminator.cv_ensemble
 
-    def _init_as_target_passthrough(self, image_channels):
+    def _init_as_target_passthrough(self, condition_channels, image_channels):
         with torch.no_grad():
             self.condition_adapter.weight.zero_()
             self.condition_adapter.bias.zero_()
             for channel in range(image_channels):
-                self.condition_adapter.weight[channel, image_channels + channel, 0, 0] = 1.0
+                self.condition_adapter.weight[channel, condition_channels + channel, 0, 0] = 1.0
 
     def forward(self, images, *args, **kwargs):
         if images.shape[1] != self.condition_adapter.in_channels:
@@ -93,7 +102,7 @@ def make_disc_input(args, x_src, x_img):
 
 def normalize_to_255(img):
     # Visualization only: model tensors are in s-domain, where background is -1.
-    img = img.detach().cpu().float()
+    img = display_image_tensor(img).detach().cpu().float()
     if img.numel() == 0:
         return torch.zeros_like(img, dtype=torch.uint8)
     
@@ -116,6 +125,16 @@ def normalize_to_255(img):
     img = img.clamp(lo, hi)
     img = (img - lo) / (hi - lo + 1e-8) * 255.0
     return img.clamp(0, 255).to(torch.uint8)
+
+
+def display_image_tensor(img):
+    if img.ndim == 3 and img.shape[0] not in (1, 3):
+        slice_channels = img.shape[0] // 2 if img.shape[0] % 2 == 0 else img.shape[0]
+        center_channel = slice_channels // 2
+        return img[center_channel : center_channel + 1].repeat(3, 1, 1)
+    if img.ndim == 3 and img.shape[0] == 1:
+        return img.repeat(3, 1, 1)
+    return img
 
 
 def unique_parameters(params):
@@ -198,11 +217,23 @@ class MedicalCTDataset(torch.utils.data.Dataset):
         tokenizer,
         prompt,
         use_xray_conditioning=False,
+        slice_context_radius=0,
+        use_mask_conditioning=False,
+        mask_relpath="mask/ct_file.mha",
+        mask_key=None,
+        require_mask_conditioning=False,
         volume_path_overrides=None,
     ):
         self.case_paths = case_paths
         self.caption = prompt
         self.use_xray_conditioning = use_xray_conditioning
+        self.slice_context_radius = int(slice_context_radius)
+        if self.slice_context_radius < 0:
+            raise ValueError("--slice_context_radius must be non-negative.")
+        self.use_mask_conditioning = use_mask_conditioning
+        self.mask_relpath = mask_relpath
+        self.mask_key = mask_key
+        self.require_mask_conditioning = require_mask_conditioning
         self.input_ids = tokenizer(
             prompt,
             max_length=tokenizer.model_max_length,
@@ -212,6 +243,7 @@ class MedicalCTDataset(torch.utils.data.Dataset):
         ).input_ids[0]
         self.index_map = []
         self._volume_info = {}
+        self._slice_case_info = {}
         self._mmap_cache = {}
         self.volume_path_overrides = volume_path_overrides or {}
 
@@ -240,7 +272,11 @@ class MedicalCTDataset(torch.utils.data.Dataset):
             if os.path.isdir(pred_dir) and os.path.isdir(gt_dir):
                 pred_files = _slice_files(pred_dir)
                 gt_files = _slice_files(gt_dir)
-                for slice_name in sorted(set(pred_files) & set(gt_files)):
+                slice_names = sorted(set(pred_files) & set(gt_files))
+                if not slice_names:
+                    continue
+                first_shape = None
+                for slice_name in slice_names:
                     coarse_path = pred_files[slice_name]
                     gt_path = gt_files[slice_name]
                     coarse_shape, _, coarse_key = get_volume_info(coarse_path)
@@ -248,6 +284,32 @@ class MedicalCTDataset(torch.utils.data.Dataset):
                     if len(coarse_shape) != 2 or len(gt_shape) != 2:
                         continue
                     if coarse_shape != gt_shape:
+                        continue
+                    if first_shape is None:
+                        first_shape = coarse_shape
+                if first_shape is None:
+                    continue
+                mask_volume = self._load_case_mask(
+                    case_path,
+                    (*first_shape, None),
+                    min_slices=len(slice_names),
+                )
+                if self.use_mask_conditioning and mask_volume is None and self.require_mask_conditioning:
+                    continue
+                case_conditioning["mask_volume"] = mask_volume
+                self._volume_info[case_path] = case_conditioning
+                self._slice_case_info[case_path] = {
+                    "slice_names": slice_names,
+                    "slice_indices": [axial_slice_index(name, fallback=pos) for pos, name in enumerate(slice_names)],
+                    "pred_files": pred_files,
+                    "gt_files": gt_files,
+                }
+                for slice_pos, slice_name in enumerate(slice_names):
+                    coarse_path = pred_files[slice_name]
+                    gt_path = gt_files[slice_name]
+                    coarse_shape, _, coarse_key = get_volume_info(coarse_path)
+                    gt_shape, _, gt_key = get_volume_info(gt_path)
+                    if len(coarse_shape) != 2 or len(gt_shape) != 2 or coarse_shape != gt_shape:
                         continue
                     self.index_map.append(
                         {
@@ -258,6 +320,7 @@ class MedicalCTDataset(torch.utils.data.Dataset):
                             "gt_path": gt_path,
                             "gt_key": gt_key,
                             "slice_name": slice_name,
+                            "slice_pos": slice_pos,
                         }
                     )
                 continue
@@ -288,6 +351,11 @@ class MedicalCTDataset(torch.utils.data.Dataset):
                 continue
             if coarse_shape != gt_shape:
                 continue
+            mask_volume = self._load_case_mask(case_path, coarse_shape)
+            if self.use_mask_conditioning and mask_volume is None and self.require_mask_conditioning:
+                continue
+            case_conditioning["mask_volume"] = mask_volume
+            self._volume_info[case_path] = case_conditioning
             # 这里的 volume_gt.npy / vol_pred.npy 已经在数据生成阶段转成 XYZ 顺序，
             # 因此 axis 2 才是 axial 方向；索引范围也要跟着改成 shape[2]。
             for slice_idx in range(coarse_shape[2]):
@@ -300,8 +368,81 @@ class MedicalCTDataset(torch.utils.data.Dataset):
                         "gt_path": gt_path,
                         "gt_key": gt_key,
                         "slice_idx": slice_idx,
+                        "total_slices": coarse_shape[2],
                     }
                 )
+
+    def _load_case_mask(self, case_path, target_shape, min_slices=None):
+        if not self.use_mask_conditioning:
+            return None
+        mask_path = Path(case_path) / self.mask_relpath
+        if not mask_path.exists():
+            return None
+        mask_volume = load_mask_volume(mask_path, target_shape=target_shape, npz_key=self.mask_key)
+        if min_slices is not None and mask_volume.shape[2] < min_slices:
+            raise ValueError(
+                f"Mask shape {tuple(mask_volume.shape)} has fewer axial slices than "
+                f"the paired slice set ({min_slices}) for {case_path}."
+            )
+        return mask_volume
+
+    def _zero_mask_stack(self, coarse_stack):
+        return np.zeros_like(coarse_stack, dtype=np.float32)
+
+    def _load_slice_mode_context(self, sample_info):
+        case_path = sample_info["case_path"]
+        slice_info = self._slice_case_info[case_path]
+        slice_names = slice_info["slice_names"]
+        slice_indices = slice_info["slice_indices"]
+        indices = clamped_context_indices(
+            sample_info["slice_pos"],
+            len(slice_names),
+            self.slice_context_radius,
+        )
+        coarse_stack = np.stack(
+            [
+                _load_array_file(slice_info["pred_files"][slice_names[i]])
+                for i in indices
+            ],
+            axis=0,
+        ).astype(np.float32)
+        mask_volume = self._volume_info[case_path].get("mask_volume")
+        if self.use_mask_conditioning:
+            mask_stack = (
+                build_context_stack_from_indices(mask_volume, [slice_indices[i] for i in indices])
+                if mask_volume is not None
+                else self._zero_mask_stack(coarse_stack)
+            )
+            coarse_stack = np.concatenate([coarse_stack, mask_stack], axis=0).astype(np.float32)
+        return coarse_stack
+
+    def _load_volume_mode_context(self, sample_info):
+        indices = clamped_context_indices(
+            sample_info["slice_idx"],
+            sample_info["total_slices"],
+            self.slice_context_radius,
+        )
+        coarse_stack = np.stack(
+            [
+                load_volume_slice(
+                    sample_info["coarse_path"],
+                    slice_idx,
+                    sample_info["coarse_key"],
+                    self._mmap_cache,
+                )
+                for slice_idx in indices
+            ],
+            axis=0,
+        ).astype(np.float32)
+        mask_volume = self._volume_info[sample_info["case_path"]].get("mask_volume")
+        if self.use_mask_conditioning:
+            mask_stack = (
+                build_context_stack(mask_volume, sample_info["slice_idx"], self.slice_context_radius)
+                if mask_volume is not None
+                else self._zero_mask_stack(coarse_stack)
+            )
+            coarse_stack = np.concatenate([coarse_stack, mask_stack], axis=0).astype(np.float32)
+        return coarse_stack
 
     def __len__(self):
         return len(self.index_map)
@@ -311,10 +452,12 @@ class MedicalCTDataset(torch.utils.data.Dataset):
         case_path = sample_info["case_path"]
         volume_info = self._volume_info[case_path]
         if sample_info["mode"] == "slice":
+            coarse_stack = self._load_slice_mode_context(sample_info)
             coarse_slice = _load_array_file(sample_info["coarse_path"], sample_info["coarse_key"])
             gt_slice = _load_array_file(sample_info["gt_path"], sample_info["gt_key"])
         else:
             # axial slice：axis 2 对应 Z 方向，因此这里沿最后一个维度取切片。
+            coarse_stack = self._load_volume_mode_context(sample_info)
             coarse_slice = load_volume_slice(
                 sample_info["coarse_path"],
                 sample_info["slice_idx"],
@@ -329,10 +472,11 @@ class MedicalCTDataset(torch.utils.data.Dataset):
             )
 
         # 这里需要 copy 一份，避免 mmap 读出的只读 numpy 数组直接转 tensor 时触发警告。
-        coarse_v = torch.from_numpy(coarse_slice.copy()).float().unsqueeze(0)
+        coarse_v = torch.from_numpy(coarse_stack.copy()).float()
+        center_coarse_v = torch.from_numpy(coarse_slice.copy()).float().unsqueeze(0)
         gt_v = torch.from_numpy(gt_slice.copy()).float().unsqueeze(0)
 
-        coarse_tensor = volume_to_slicefixer(coarse_v).repeat(3, 1, 1)
+        coarse_tensor = volume_to_slicefixer(coarse_v)
         gt_tensor = volume_to_slicefixer(gt_v).repeat(3, 1, 1)
 
         sample = {
@@ -341,9 +485,9 @@ class MedicalCTDataset(torch.utils.data.Dataset):
             "output_pixel_values": gt_tensor,
             "caption": self.caption,
             "input_ids": self.input_ids,
-            "coarse_v_max_before_clip": coarse_v.max(),
+            "coarse_v_max_before_clip": center_coarse_v.max(),
             "gt_v_max_before_clip": gt_v.max(),
-            "coarse_v_upper_clipped_ratio": (coarse_v > 1.0).float().mean(),
+            "coarse_v_upper_clipped_ratio": (center_coarse_v > 1.0).float().mean(),
             "gt_v_upper_clipped_ratio": (gt_v > 1.0).float().mean(),
         }
         if self.use_xray_conditioning:
@@ -373,6 +517,17 @@ def main(args):
         os.makedirs(os.path.join(args.output_dir, "checkpoints"), exist_ok=True)
         os.makedirs(os.path.join(args.output_dir, "eval"), exist_ok=True)
 
+    conditioning_in_channels = context_channel_count(
+        args.slice_context_radius,
+        use_mask_conditioning=args.use_mask_conditioning,
+    )
+    if accelerator.is_main_process:
+        print(
+            f"SliceFixer conditioning channels: {conditioning_in_channels} "
+            f"(slice_context_radius={args.slice_context_radius}, "
+            f"use_mask_conditioning={args.use_mask_conditioning})"
+        )
+
     net_pix2pix = SliceFixer(
         pretrained_name=None,
         pretrained_path=args.slicefixer_pretrained_path,
@@ -380,6 +535,7 @@ def main(args):
         lora_rank_vae=args.lora_rank_vae,
         sd_turbo_path=args.pretrained_model_name_or_path,
         use_xray_conditioning=args.use_xray_conditioning,
+        conditioning_in_channels=conditioning_in_channels,
     )
     net_pix2pix.set_train()
 
@@ -398,7 +554,11 @@ def main(args):
     if args.gan_disc_type == "vagan_clip":
         import vision_aided_loss
         base_disc = vision_aided_loss.Discriminator(cv_type='clip', loss_type=args.gan_loss_type, device="cuda")
-        net_disc = base_disc if args.disable_conditional_gan else ConditionalDiscriminator(base_disc)
+        net_disc = (
+            base_disc
+            if args.disable_conditional_gan
+            else ConditionalDiscriminator(base_disc, condition_channels=conditioning_in_channels)
+        )
     else:
         raise NotImplementedError(f"Discriminator type {args.gan_disc_type} not implemented")
 
@@ -434,6 +594,7 @@ def main(args):
         list(net_pix2pix.vae.decoder.skip_conv_4.parameters())
     if args.use_xray_conditioning:
         layers_to_opt += list(net_pix2pix.fusion_adapter.parameters())
+    layers_to_opt += list(net_pix2pix.input_adapter.parameters())
     # 防止 conv_in、skip_conv 或 LoRA 参数在不同收集路径中被重复加入。
     layers_to_opt = unique_parameters(layers_to_opt)
 
@@ -515,6 +676,11 @@ def main(args):
         tokenizer=tokenizer,
         prompt=prompt,
         use_xray_conditioning=args.use_xray_conditioning,
+        slice_context_radius=args.slice_context_radius,
+        use_mask_conditioning=args.use_mask_conditioning,
+        mask_relpath=args.mask_relpath,
+        mask_key=args.mask_key,
+        require_mask_conditioning=args.require_mask_conditioning,
         volume_path_overrides=val_overrides,
     )
     val_sample_count = min(args.num_samples_eval, len(dataset_val))
@@ -534,6 +700,11 @@ def main(args):
             tokenizer=tokenizer,
             prompt=prompt,
             use_xray_conditioning=args.use_xray_conditioning,
+            slice_context_radius=args.slice_context_radius,
+            use_mask_conditioning=args.use_mask_conditioning,
+            mask_relpath=args.mask_relpath,
+            mask_key=args.mask_key,
+            require_mask_conditioning=args.require_mask_conditioning,
             volume_path_overrides=volume_path_overrides,
         )
         dataloader = torch.utils.data.DataLoader(
@@ -889,7 +1060,12 @@ def main(args):
                             local_metrics.append(torch.stack(metric_values))
                             sample_index = int(batch_val["sample_index"][0].item())
                             if val_preview is None or sample_index > val_preview[0]:
-                                val_preview = (sample_index, val_src[0], val_tgt[0], val_pred[0])
+                                val_preview = (
+                                    sample_index,
+                                    display_image_tensor(val_src[0]),
+                                    display_image_tensor(val_tgt[0]),
+                                    display_image_tensor(val_pred[0]),
+                                )
                             if args.track_val_fid:
                                 output_pil = transforms.ToPILImage()(val_pred[0].cpu() * 0.5 + 0.5)
                                 outf = os.path.join(

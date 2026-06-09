@@ -20,6 +20,15 @@ sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(REPO_ROOT / "slicefixer"))
 
 from SliceFixer import SliceFixer
+from conditioning_utils import (
+    axial_slice_index,
+    build_context_stack,
+    build_context_stack_from_indices,
+    clamped_context_indices,
+    context_channel_count,
+    load_mask_volume,
+    resolve_mask_path,
+)
 from intensity_utils import slicefixer_to_volume, volume_to_slicefixer
 
 
@@ -42,6 +51,20 @@ def parse_args():
     parser.add_argument("--preview-every", type=int, default=50)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--fp16", action="store_true", help="Run SliceFixer inference in fp16 to reduce VRAM.")
+    parser.add_argument(
+        "--slice-context-radius",
+        type=int,
+        default=0,
+        help="Number of neighboring axial slices to add on each side. Use 2 for five-slice 2.5D input.",
+    )
+    parser.add_argument(
+        "--mask-path",
+        default=None,
+        help="Optional segmentation mask volume (.mha/.mhd/.npy/.npz). Defaults to <case_dir>/mask/ct_file.mha when present.",
+    )
+    parser.add_argument("--mask-relpath", default="mask/ct_file.mha")
+    parser.add_argument("--mask-key", default=None, help="NPZ key when --mask-path points to a .npz mask.")
+    parser.add_argument("--require-mask", action="store_true", help="Fail if no mask is found.")
     return parser.parse_args()
 
 
@@ -202,8 +225,40 @@ def main():
         f"slices={len(pred_items)}/{len(pred_paths)}",
         flush=True,
     )
-    print(f"Loading SliceFixer checkpoint: {args.checkpoint}", flush=True)
-    model = SliceFixer(pretrained_path=args.checkpoint, sd_turbo_path=args.sd_turbo_path).to(device)
+    pred_volume = np.stack([load_npz_key(path, args.pred_key) for path in pred_paths], axis=-1).astype(np.float32)
+    pred_slice_indices = [axial_slice_index(path, fallback=pos) for pos, path in enumerate(pred_paths)]
+    mask_path = resolve_mask_path(
+        case_dir,
+        explicit_mask_path=args.mask_path,
+        mask_relpath=args.mask_relpath,
+        require_mask=args.require_mask,
+    )
+    mask_volume = None
+    if mask_path is not None:
+        mask_volume = load_mask_volume(mask_path, target_shape=(*pred_volume.shape[:2], None), npz_key=args.mask_key)
+        if mask_volume.shape[2] < pred_volume.shape[2]:
+            raise ValueError(
+                f"Mask shape {tuple(mask_volume.shape)} has fewer axial slices than "
+                f"the prediction volume ({pred_volume.shape[2]})."
+            )
+        print(f"Loaded segmentation mask: {mask_path}, shape={mask_volume.shape}", flush=True)
+
+    conditioning_in_channels = context_channel_count(
+        args.slice_context_radius,
+        use_mask_conditioning=mask_volume is not None,
+    )
+    print(
+        f"Loading SliceFixer checkpoint: {args.checkpoint} "
+        f"conditioning_channels={conditioning_in_channels} "
+        f"slice_context_radius={args.slice_context_radius} "
+        f"use_mask={mask_volume is not None}",
+        flush=True,
+    )
+    model = SliceFixer(
+        pretrained_path=args.checkpoint,
+        sd_turbo_path=args.sd_turbo_path,
+        conditioning_in_channels=conditioning_in_channels,
+    ).to(device)
     model.set_eval()
     if args.fp16:
         model.half()
@@ -217,12 +272,26 @@ def main():
     with torch.inference_mode():
         progress = tqdm(pred_items, desc=f"SliceFixer {case_id} rank{rank}", disable=rank != 0)
         for global_idx, pred_path in progress:
-            pred_v = load_npz_key(pred_path, args.pred_key)
+            pred_v = pred_volume[:, :, global_idx]
             original_hw = pred_v.shape[-2:]
-            pred_tensor = torch.from_numpy(pred_v).float().to(device).unsqueeze(0).unsqueeze(0)
+            slice_stack = build_context_stack(pred_volume, global_idx, args.slice_context_radius)
+            if mask_volume is None:
+                conditioning_v = slice_stack
+            else:
+                context_positions = clamped_context_indices(
+                    global_idx,
+                    len(pred_slice_indices),
+                    args.slice_context_radius,
+                )
+                mask_stack = build_context_stack_from_indices(
+                    mask_volume,
+                    [pred_slice_indices[pos] for pos in context_positions],
+                )
+                conditioning_v = np.concatenate([slice_stack, mask_stack], axis=0).astype(np.float32)
+            pred_tensor = torch.from_numpy(conditioning_v).float().to(device).unsqueeze(0)
             pred_tensor = torch.clamp(pred_tensor, 0.0, 1.0)
             pred_512 = F.interpolate(pred_tensor, size=(512, 512), mode="bilinear", align_corners=False)
-            c_t = volume_to_slicefixer(pred_512).repeat(1, 3, 1, 1)
+            c_t = volume_to_slicefixer(pred_512)
             if args.fp16:
                 c_t = c_t.half()
 

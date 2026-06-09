@@ -102,6 +102,34 @@ def parse_args_paired_training(input_args=None):
         action="store_true",
         help="Condition SliceFixer on the two precomputed RAD-DINO projection embeddings.",
     )
+    parser.add_argument(
+        "--slice_context_radius",
+        type=int,
+        default=0,
+        help="Number of neighboring axial slices to condition on each side. Use 2 for five-slice 2.5D input.",
+    )
+    parser.add_argument(
+        "--use_mask_conditioning",
+        action="store_true",
+        help="Append the same number of binary spine-mask slices to the conditioning input.",
+    )
+    parser.add_argument(
+        "--mask_relpath",
+        default="mask/ct_file.mha",
+        type=str,
+        help="Mask path relative to each case directory when --use_mask_conditioning is enabled.",
+    )
+    parser.add_argument(
+        "--mask_key",
+        default=None,
+        type=str,
+        help="NPZ key when mask_relpath points to a .npz mask.",
+    )
+    parser.add_argument(
+        "--require_mask_conditioning",
+        action="store_true",
+        help="Skip cases without a readable mask instead of using zero mask channels.",
+    )
 
     # training details
     parser.add_argument("--output_dir", required=True)
