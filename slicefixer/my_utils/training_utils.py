@@ -115,9 +115,9 @@ def parse_args_paired_training(input_args=None):
     )
     parser.add_argument(
         "--mask_relpath",
-        default="mask/ct_file.mha",
+        default="mask",
         type=str,
-        help="Mask path relative to each case directory when --use_mask_conditioning is enabled.",
+        help="Mask slice directory relative to each case directory when --use_mask_conditioning is enabled.",
     )
     parser.add_argument(
         "--mask_key",
@@ -155,21 +155,23 @@ def parse_args_paired_training(input_args=None):
     )
     parser.add_argument("--lr_power", type=float, default=1.0, help="Power factor of the polynomial scheduler.")
 
-    parser.add_argument("--dataloader_num_workers", type=int, default=0,)
+    parser.add_argument("--dataloader_num_workers", type=int, default=8,)
     parser.add_argument(
         "--val_dataloader_num_workers",
         type=int,
-        default=0,
-        help="Number of validation DataLoader workers. Defaults to 0 for compatibility.",
+        default=8,
+        help="Number of validation DataLoader workers.",
     )
     parser.add_argument(
         "--pin_memory",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help="Enable pinned host memory for train/validation DataLoaders.",
     )
     parser.add_argument(
         "--persistent_workers",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help="Keep DataLoader workers alive between epochs/cache blocks when num_workers > 0.",
     )
     parser.add_argument(
@@ -234,7 +236,7 @@ def parse_args_unpaired_training():
     parser.add_argument("--dataset_folder", required=True, type=str)
     parser.add_argument("--train_img_prep", required=True)
     parser.add_argument("--val_img_prep", required=True)
-    parser.add_argument("--dataloader_num_workers", type=int, default=0)
+    parser.add_argument("--dataloader_num_workers", type=int, default=8)
     parser.add_argument("--train_batch_size", type=int, default=4, help="Batch size (per device) for the training dataloader.")
     parser.add_argument("--max_train_epochs", type=int, default=100)
     parser.add_argument("--max_train_steps", type=int, default=None)

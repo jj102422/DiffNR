@@ -3,6 +3,7 @@ import atexit
 from pathlib import Path
 import zipfile
 import json
+import pickle
 import random
 import sys
 import time
@@ -194,6 +195,120 @@ def _slice_files(slice_dir):
     return paths
 
 
+def _slice_manifest_cache_valid(payload, case_paths, use_mask_conditioning, mask_relpath, require_mask_conditioning):
+    return (
+        payload.get("version") == 1
+        and payload.get("case_paths") == [str(p) for p in case_paths]
+        and payload.get("use_mask_conditioning") == bool(use_mask_conditioning)
+        and payload.get("mask_relpath") == str(mask_relpath)
+        and payload.get("require_mask_conditioning") == bool(require_mask_conditioning)
+    )
+
+
+def _build_slice_manifest(case_paths, use_mask_conditioning=False, mask_relpath="mask", require_mask_conditioning=False):
+    manifest = {}
+    for case_path in case_paths:
+        case_path = str(case_path)
+        pred_dir = os.path.join(case_path, "pred")
+        gt_dir = os.path.join(case_path, "gt")
+        if not os.path.isdir(pred_dir) or not os.path.isdir(gt_dir):
+            continue
+        pred_files = _slice_files(pred_dir)
+        gt_files = _slice_files(gt_dir)
+        slice_names = sorted(set(pred_files) & set(gt_files))
+        if not slice_names:
+            continue
+
+        mask_dir = None
+        if use_mask_conditioning:
+            candidate_mask_dir = Path(case_path) / mask_relpath
+            if candidate_mask_dir.is_dir():
+                mask_files = _slice_files(candidate_mask_dir)
+                missing_masks = [name for name in slice_names if name not in mask_files]
+                if missing_masks:
+                    if require_mask_conditioning:
+                        continue
+                else:
+                    mask_dir = str(candidate_mask_dir)
+            elif require_mask_conditioning:
+                continue
+
+        first_slice_name = slice_names[0]
+        first_coarse_shape, _, _ = get_volume_info(pred_files[first_slice_name])
+        first_gt_shape, _, _ = get_volume_info(gt_files[first_slice_name])
+        if len(first_coarse_shape) != 2 or len(first_gt_shape) != 2 or first_coarse_shape != first_gt_shape:
+            continue
+
+        if use_mask_conditioning and mask_dir is not None:
+            first_mask_path = os.path.join(mask_dir, first_slice_name)
+            first_mask_shape, _, _ = get_volume_info(first_mask_path)
+            if len(first_mask_shape) != 2 or tuple(first_mask_shape) != tuple(first_coarse_shape):
+                if require_mask_conditioning:
+                    continue
+                mask_dir = None
+
+        manifest[case_path] = {
+            "slice_names": slice_names,
+            "pred_dir": pred_dir,
+            "gt_dir": gt_dir,
+            "mask_dir": mask_dir,
+        }
+    return manifest
+
+
+def load_or_build_slice_manifest(
+    cache_path,
+    case_paths,
+    use_mask_conditioning=False,
+    mask_relpath="mask",
+    require_mask_conditioning=False,
+):
+    cache_path = Path(cache_path)
+    if cache_path.exists():
+        try:
+            with cache_path.open("rb") as handle:
+                payload = pickle.load(handle)
+            if _slice_manifest_cache_valid(
+                payload,
+                case_paths,
+                use_mask_conditioning,
+                mask_relpath,
+                require_mask_conditioning,
+            ):
+                return payload["cases"], True
+        except Exception:
+            pass
+
+    manifest = _build_slice_manifest(
+        case_paths,
+        use_mask_conditioning=use_mask_conditioning,
+        mask_relpath=mask_relpath,
+        require_mask_conditioning=require_mask_conditioning,
+    )
+    payload = {
+        "version": 1,
+        "case_paths": [str(p) for p in case_paths],
+        "use_mask_conditioning": bool(use_mask_conditioning),
+        "mask_relpath": str(mask_relpath),
+        "require_mask_conditioning": bool(require_mask_conditioning),
+        "cases": manifest,
+    }
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
+    with temporary_path.open("wb") as handle:
+        pickle.dump(payload, handle, protocol=pickle.HIGHEST_PROTOCOL)
+    os.replace(temporary_path, cache_path)
+    return manifest, False
+
+
+def load_slice_manifest(cache_path):
+    cache_path = Path(cache_path)
+    if not cache_path.exists():
+        return {}
+    with cache_path.open("rb") as handle:
+        return pickle.load(handle).get("cases", {})
+
+
 def load_volume_slice(path, slice_idx, key=None, mmap_cache=None):
     if path.endswith(".npz"):
         with np.load(path) as data:
@@ -223,6 +338,7 @@ class MedicalCTDataset(torch.utils.data.Dataset):
         mask_key=None,
         require_mask_conditioning=False,
         volume_path_overrides=None,
+        slice_case_manifest=None,
     ):
         self.case_paths = case_paths
         self.caption = prompt
@@ -246,6 +362,7 @@ class MedicalCTDataset(torch.utils.data.Dataset):
         self._slice_case_info = {}
         self._mmap_cache = {}
         self.volume_path_overrides = volume_path_overrides or {}
+        self.slice_case_manifest = slice_case_manifest or {}
 
         for case_path in self.case_paths:
             case_name = os.path.basename(case_path.rstrip(os.sep))
@@ -269,56 +386,96 @@ class MedicalCTDataset(torch.utils.data.Dataset):
 
             pred_dir = os.path.join(case_path, "pred")
             gt_dir = os.path.join(case_path, "gt")
+            slice_manifest = self.slice_case_manifest.get(str(case_path))
+            if slice_manifest is not None:
+                slice_names = slice_manifest["slice_names"]
+                if not slice_names:
+                    continue
+                pred_dir = slice_manifest["pred_dir"]
+                gt_dir = slice_manifest["gt_dir"]
+                mask_dir = slice_manifest.get("mask_dir")
+                pred_files = {name: os.path.join(pred_dir, name) for name in slice_names}
+                gt_files = {name: os.path.join(gt_dir, name) for name in slice_names}
+                mask_files = (
+                    {name: os.path.join(mask_dir, name) for name in slice_names}
+                    if self.use_mask_conditioning and mask_dir is not None
+                    else None
+                )
+                case_conditioning["mask_files"] = mask_files
+                self._volume_info[case_path] = case_conditioning
+                self._slice_case_info[case_path] = {
+                    "slice_names": slice_names,
+                    "pred_files": pred_files,
+                    "gt_files": gt_files,
+                    "mask_files": mask_files,
+                }
+                for slice_pos, slice_name in enumerate(slice_names):
+                    self.index_map.append(
+                        {
+                            "case_path": case_path,
+                            "mode": "slice",
+                            "coarse_path": pred_files[slice_name],
+                            "coarse_key": None,
+                            "gt_path": gt_files[slice_name],
+                            "gt_key": None,
+                            "slice_name": slice_name,
+                            "slice_pos": slice_pos,
+                        }
+                    )
+                continue
+
             if os.path.isdir(pred_dir) and os.path.isdir(gt_dir):
                 pred_files = _slice_files(pred_dir)
                 gt_files = _slice_files(gt_dir)
                 slice_names = sorted(set(pred_files) & set(gt_files))
                 if not slice_names:
                     continue
-                first_shape = None
-                for slice_name in slice_names:
-                    coarse_path = pred_files[slice_name]
-                    gt_path = gt_files[slice_name]
-                    coarse_shape, _, coarse_key = get_volume_info(coarse_path)
-                    gt_shape, _, gt_key = get_volume_info(gt_path)
-                    if len(coarse_shape) != 2 or len(gt_shape) != 2:
+                mask_files = None
+                if self.use_mask_conditioning:
+                    mask_dir = Path(case_path) / self.mask_relpath
+                    if mask_dir.is_dir():
+                        mask_files = _slice_files(mask_dir)
+                    elif self.require_mask_conditioning:
                         continue
-                    if coarse_shape != gt_shape:
-                        continue
-                    if first_shape is None:
-                        first_shape = coarse_shape
-                if first_shape is None:
+
+                first_slice_name = slice_names[0]
+                first_coarse_shape, _, _ = get_volume_info(pred_files[first_slice_name])
+                first_gt_shape, _, _ = get_volume_info(gt_files[first_slice_name])
+                if len(first_coarse_shape) != 2 or len(first_gt_shape) != 2:
                     continue
-                mask_volume = self._load_case_mask(
-                    case_path,
-                    (*first_shape, None),
-                    min_slices=len(slice_names),
-                )
-                if self.use_mask_conditioning and mask_volume is None and self.require_mask_conditioning:
+                if first_coarse_shape != first_gt_shape:
                     continue
-                case_conditioning["mask_volume"] = mask_volume
+                if self.use_mask_conditioning and mask_files is not None:
+                    missing_masks = [name for name in slice_names if name not in mask_files]
+                    if missing_masks:
+                        if self.require_mask_conditioning:
+                            continue
+                        mask_files = None
+                    else:
+                        first_mask_shape, _, _ = get_volume_info(mask_files[slice_names[0]])
+                        if len(first_mask_shape) != 2 or tuple(first_mask_shape) != tuple(first_coarse_shape):
+                            if self.require_mask_conditioning:
+                                continue
+                            mask_files = None
+                case_conditioning["mask_files"] = mask_files
                 self._volume_info[case_path] = case_conditioning
                 self._slice_case_info[case_path] = {
                     "slice_names": slice_names,
-                    "slice_indices": [axial_slice_index(name, fallback=pos) for pos, name in enumerate(slice_names)],
                     "pred_files": pred_files,
                     "gt_files": gt_files,
+                    "mask_files": mask_files,
                 }
                 for slice_pos, slice_name in enumerate(slice_names):
                     coarse_path = pred_files[slice_name]
                     gt_path = gt_files[slice_name]
-                    coarse_shape, _, coarse_key = get_volume_info(coarse_path)
-                    gt_shape, _, gt_key = get_volume_info(gt_path)
-                    if len(coarse_shape) != 2 or len(gt_shape) != 2 or coarse_shape != gt_shape:
-                        continue
                     self.index_map.append(
                         {
                             "case_path": case_path,
                             "mode": "slice",
                             "coarse_path": coarse_path,
-                            "coarse_key": coarse_key,
+                            "coarse_key": None,
                             "gt_path": gt_path,
-                            "gt_key": gt_key,
+                            "gt_key": None,
                             "slice_name": slice_name,
                             "slice_pos": slice_pos,
                         }
@@ -376,6 +533,8 @@ class MedicalCTDataset(torch.utils.data.Dataset):
         if not self.use_mask_conditioning:
             return None
         mask_path = Path(case_path) / self.mask_relpath
+        if mask_path.is_dir():
+            return None
         if not mask_path.exists():
             return None
         mask_volume = load_mask_volume(mask_path, target_shape=target_shape, npz_key=self.mask_key)
@@ -393,7 +552,6 @@ class MedicalCTDataset(torch.utils.data.Dataset):
         case_path = sample_info["case_path"]
         slice_info = self._slice_case_info[case_path]
         slice_names = slice_info["slice_names"]
-        slice_indices = slice_info["slice_indices"]
         indices = clamped_context_indices(
             sample_info["slice_pos"],
             len(slice_names),
@@ -406,13 +564,18 @@ class MedicalCTDataset(torch.utils.data.Dataset):
             ],
             axis=0,
         ).astype(np.float32)
-        mask_volume = self._volume_info[case_path].get("mask_volume")
         if self.use_mask_conditioning:
-            mask_stack = (
-                build_context_stack_from_indices(mask_volume, [slice_indices[i] for i in indices])
-                if mask_volume is not None
-                else self._zero_mask_stack(coarse_stack)
-            )
+            mask_files = slice_info.get("mask_files")
+            if mask_files is not None:
+                mask_stack = np.stack(
+                    [
+                        (_load_array_file(mask_files[slice_names[i]], self.mask_key) > 0).astype(np.float32)
+                        for i in indices
+                    ],
+                    axis=0,
+                )
+            else:
+                mask_stack = self._zero_mask_stack(coarse_stack)
             coarse_stack = np.concatenate([coarse_stack, mask_stack], axis=0).astype(np.float32)
         return coarse_stack
 
@@ -639,6 +802,35 @@ def main(args):
     train_case_paths = to_case_paths(train_ids)
     val_case_paths = to_case_paths(val_ids)
 
+    manifest_dir = Path(args.output_dir) / "slice_manifests"
+    train_manifest_path = manifest_dir / f"{args.train_split}.pkl"
+    val_manifest_path = manifest_dir / f"{args.val_split}.pkl"
+    if accelerator.is_main_process:
+        start_time = time.time()
+        train_manifest, train_manifest_cached = load_or_build_slice_manifest(
+            train_manifest_path,
+            train_case_paths,
+            use_mask_conditioning=args.use_mask_conditioning,
+            mask_relpath=args.mask_relpath,
+            require_mask_conditioning=args.require_mask_conditioning,
+        )
+        val_manifest, val_manifest_cached = load_or_build_slice_manifest(
+            val_manifest_path,
+            val_case_paths,
+            use_mask_conditioning=args.use_mask_conditioning,
+            mask_relpath=args.mask_relpath,
+            require_mask_conditioning=args.require_mask_conditioning,
+        )
+        print(
+            "Slice manifest ready: "
+            f"train_cases={len(train_manifest)} ({'cached' if train_manifest_cached else 'built'}), "
+            f"val_cases={len(val_manifest)} ({'cached' if val_manifest_cached else 'built'}), "
+            f"elapsed={time.time() - start_time:.1f}s"
+        )
+    accelerator.wait_for_everyone()
+    train_slice_manifest = load_slice_manifest(train_manifest_path)
+    val_slice_manifest = load_slice_manifest(val_manifest_path)
+
     prompt = "high quality medical CT slice, clear anatomical structures"
     tokenizer = net_pix2pix.tokenizer
     use_volume_cache = args.use_volume_cache and not args.disable_volume_cache
@@ -682,6 +874,7 @@ def main(args):
         mask_key=args.mask_key,
         require_mask_conditioning=args.require_mask_conditioning,
         volume_path_overrides=val_overrides,
+        slice_case_manifest=val_slice_manifest,
     )
     val_sample_count = min(args.num_samples_eval, len(dataset_val))
     if val_sample_count == 0:
@@ -706,6 +899,7 @@ def main(args):
             mask_key=args.mask_key,
             require_mask_conditioning=args.require_mask_conditioning,
             volume_path_overrides=volume_path_overrides,
+            slice_case_manifest=train_slice_manifest,
         )
         dataloader = torch.utils.data.DataLoader(
             dataset,

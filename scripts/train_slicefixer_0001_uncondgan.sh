@@ -25,7 +25,7 @@ MAIN_PROCESS_PORT=${MAIN_PROCESS_PORT-29501}
 SLICE_CONTEXT_RADIUS=${SLICE_CONTEXT_RADIUS-2}
 USE_MASK_CONDITIONING=${USE_MASK_CONDITIONING-1}
 REQUIRE_MASK_CONDITIONING=${REQUIRE_MASK_CONDITIONING-1}
-MASK_RELPATH=${MASK_RELPATH-mask/ct_file.mha}
+MASK_RELPATH=${MASK_RELPATH-mask}
 export WANDB_MODE=${WANDB_MODE-online}
 
 if [ ! -d "$DATASET_ROOT/$CASE_ID/gt" ] || [ ! -d "$DATASET_ROOT/$CASE_ID/pred" ]; then
@@ -77,14 +77,9 @@ accelerate launch \
   --train_split train \
   --val_split eval \
   --use_xray_conditioning \
-  --use_volume_cache \
-  --volume_cache_dir /dev/shm/slicefixer_volume_cache \
-  --volume_cache_cases_per_block 8 \
   --learning_rate 1e-5 \
   --lr_scheduler constant \
-  --train_batch_size 1 \
   --gradient_accumulation_steps 4 \
-  --dataloader_num_workers 2 \
   --max_train_steps 100000 \
   --checkpointing_steps 5000 \
   --gradient_checkpointing \

@@ -21,7 +21,6 @@ sys.path.insert(0, str(REPO_ROOT / "slicefixer"))
 
 from SliceFixer import SliceFixer
 from conditioning_utils import (
-    axial_slice_index,
     build_context_stack,
     build_context_stack_from_indices,
     clamped_context_indices,
@@ -60,9 +59,9 @@ def parse_args():
     parser.add_argument(
         "--mask-path",
         default=None,
-        help="Optional segmentation mask volume (.mha/.mhd/.npy/.npz). Defaults to <case_dir>/mask/ct_file.mha when present.",
+        help="Optional segmentation mask slice directory or volume file. Defaults to <case_dir>/mask when present.",
     )
-    parser.add_argument("--mask-relpath", default="mask/ct_file.mha")
+    parser.add_argument("--mask-relpath", default="mask")
     parser.add_argument("--mask-key", default=None, help="NPZ key when --mask-path points to a .npz mask.")
     parser.add_argument("--require-mask", action="store_true", help="Fail if no mask is found.")
     return parser.parse_args()
@@ -72,6 +71,15 @@ def load_npz_key(path, preferred_key):
     with np.load(path) as data:
         key = preferred_key if preferred_key in data.files else data.files[0]
         return data[key].astype(np.float32)
+
+
+def slice_files(slice_dir):
+    paths = {}
+    for suffix in ("*.npz", "*.npy"):
+        for path in Path(slice_dir).glob(suffix):
+            if path.is_file():
+                paths[path.name] = path
+    return paths
 
 
 def load_xray_feature(path, device):
@@ -226,7 +234,6 @@ def main():
         flush=True,
     )
     pred_volume = np.stack([load_npz_key(path, args.pred_key) for path in pred_paths], axis=-1).astype(np.float32)
-    pred_slice_indices = [axial_slice_index(path, fallback=pos) for pos, path in enumerate(pred_paths)]
     mask_path = resolve_mask_path(
         case_dir,
         explicit_mask_path=args.mask_path,
@@ -234,24 +241,34 @@ def main():
         require_mask=args.require_mask,
     )
     mask_volume = None
+    mask_files = None
     if mask_path is not None:
-        mask_volume = load_mask_volume(mask_path, target_shape=(*pred_volume.shape[:2], None), npz_key=args.mask_key)
-        if mask_volume.shape[2] < pred_volume.shape[2]:
-            raise ValueError(
-                f"Mask shape {tuple(mask_volume.shape)} has fewer axial slices than "
-                f"the prediction volume ({pred_volume.shape[2]})."
-            )
-        print(f"Loaded segmentation mask: {mask_path}, shape={mask_volume.shape}", flush=True)
+        if Path(mask_path).is_dir():
+            mask_files = slice_files(mask_path)
+            missing_masks = [path.name for path in pred_paths if path.name not in mask_files]
+            if missing_masks:
+                raise FileNotFoundError(
+                    f"Missing mask slices under {mask_path}: {missing_masks[:10]}... total={len(missing_masks)}"
+                )
+            print(f"Loaded segmentation mask slices: {mask_path}, slices={len(mask_files)}", flush=True)
+        else:
+            mask_volume = load_mask_volume(mask_path, target_shape=(*pred_volume.shape[:2], None), npz_key=args.mask_key)
+            if mask_volume.shape[2] < pred_volume.shape[2]:
+                raise ValueError(
+                    f"Mask shape {tuple(mask_volume.shape)} has fewer axial slices than "
+                    f"the prediction volume ({pred_volume.shape[2]})."
+                )
+            print(f"Loaded segmentation mask volume: {mask_path}, shape={mask_volume.shape}", flush=True)
 
     conditioning_in_channels = context_channel_count(
         args.slice_context_radius,
-        use_mask_conditioning=mask_volume is not None,
+        use_mask_conditioning=mask_volume is not None or mask_files is not None,
     )
     print(
         f"Loading SliceFixer checkpoint: {args.checkpoint} "
         f"conditioning_channels={conditioning_in_channels} "
         f"slice_context_radius={args.slice_context_radius} "
-        f"use_mask={mask_volume is not None}",
+        f"use_mask={mask_volume is not None or mask_files is not None}",
         flush=True,
     )
     model = SliceFixer(
@@ -275,18 +292,24 @@ def main():
             pred_v = pred_volume[:, :, global_idx]
             original_hw = pred_v.shape[-2:]
             slice_stack = build_context_stack(pred_volume, global_idx, args.slice_context_radius)
-            if mask_volume is None:
+            if mask_volume is None and mask_files is None:
                 conditioning_v = slice_stack
             else:
                 context_positions = clamped_context_indices(
                     global_idx,
-                    len(pred_slice_indices),
+                    len(pred_paths),
                     args.slice_context_radius,
                 )
-                mask_stack = build_context_stack_from_indices(
-                    mask_volume,
-                    [pred_slice_indices[pos] for pos in context_positions],
-                )
+                if mask_files is not None:
+                    mask_stack = np.stack(
+                        [
+                            (load_npz_key(mask_files[pred_paths[pos].name], args.mask_key) > 0).astype(np.float32)
+                            for pos in context_positions
+                        ],
+                        axis=0,
+                    )
+                else:
+                    mask_stack = build_context_stack_from_indices(mask_volume, context_positions)
                 conditioning_v = np.concatenate([slice_stack, mask_stack], axis=0).astype(np.float32)
             pred_tensor = torch.from_numpy(conditioning_v).float().to(device).unsqueeze(0)
             pred_tensor = torch.clamp(pred_tensor, 0.0, 1.0)
