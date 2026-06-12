@@ -1,6 +1,11 @@
 numpy
 scipy
 pyyaml
+pandas
+h5py
+nibabel
+lpips
+openpyxl
 tqdm
 opencv-python
 pillow
