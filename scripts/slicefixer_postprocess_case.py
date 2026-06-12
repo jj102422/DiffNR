@@ -48,18 +48,24 @@ def parse_args():
     parser.add_argument("--max-slices", type=int, default=None)
     parser.add_argument("--save-slices", action="store_true", help="Save per-slice npz files.")
     parser.add_argument("--preview-every", type=int, default=50)
+    parser.add_argument("--skip-nifti", action="store_true", help="Skip writing pred.nii.gz and gt.nii.gz.")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--fp16", action="store_true", help="Run SliceFixer inference in fp16 to reduce VRAM.")
     parser.add_argument(
         "--slice-context-radius",
         type=int,
-        default=0,
+        default=2,
         help="Number of neighboring axial slices to add on each side. Use 2 for five-slice 2.5D input.",
+    )
+    parser.add_argument(
+        "--use-mask-conditioning",
+        action="store_true",
+        help="Append binary segmentation mask slices to the conditioning input.",
     )
     parser.add_argument(
         "--mask-path",
         default=None,
-        help="Optional segmentation mask slice directory or volume file. Defaults to <case_dir>/mask when present.",
+        help="Optional segmentation mask slice directory or volume file. Passing this enables mask conditioning.",
     )
     parser.add_argument("--mask-relpath", default="mask")
     parser.add_argument("--mask-key", default=None, help="NPZ key when --mask-path points to a .npz mask.")
@@ -234,11 +240,16 @@ def main():
         flush=True,
     )
     pred_volume = np.stack([load_npz_key(path, args.pred_key) for path in pred_paths], axis=-1).astype(np.float32)
-    mask_path = resolve_mask_path(
-        case_dir,
-        explicit_mask_path=args.mask_path,
-        mask_relpath=args.mask_relpath,
-        require_mask=args.require_mask,
+    use_mask_conditioning = args.use_mask_conditioning or args.require_mask or args.mask_path is not None
+    mask_path = (
+        resolve_mask_path(
+            case_dir,
+            explicit_mask_path=args.mask_path,
+            mask_relpath=args.mask_relpath,
+            require_mask=args.require_mask,
+        )
+        if use_mask_conditioning
+        else None
     )
     mask_volume = None
     mask_files = None
@@ -368,9 +379,10 @@ def main():
             raise RuntimeError(f"Missing reconstructed slices: {missing[:10]}... total={len(missing)}")
         volume = np.stack(ordered_slices, axis=-1).astype(np.float32)
         np.savez_compressed(out_dir / "vol_pred_slicefixer.npz", vol_pred=volume)
-        save_nifti(out_dir / "pred.nii.gz", volume)
-        gt_volume = load_gt_volume(gt_dir, [path.name for path in pred_paths], args.gt_key)
-        save_nifti(out_dir / "gt.nii.gz", gt_volume)
+        if not args.skip_nifti:
+            save_nifti(out_dir / "pred.nii.gz", volume)
+            gt_volume = load_gt_volume(gt_dir, [path.name for path in pred_paths], args.gt_key)
+            save_nifti(out_dir / "gt.nii.gz", gt_volume)
 
         all_metric_rows = []
         for metrics_path in sorted(shard_dir.glob("metrics_rank*.csv")):
@@ -395,8 +407,9 @@ def main():
     )
     if rank == 0:
         print(f"saved_volume={out_dir / 'vol_pred_slicefixer.npz'}", flush=True)
-        print(f"saved_pred_nii={out_dir / 'pred.nii.gz'}", flush=True)
-        print(f"saved_gt_nii={out_dir / 'gt.nii.gz'}", flush=True)
+        if not args.skip_nifti:
+            print(f"saved_pred_nii={out_dir / 'pred.nii.gz'}", flush=True)
+            print(f"saved_gt_nii={out_dir / 'gt.nii.gz'}", flush=True)
         print(f"preview_dir={preview_dir}", flush=True)
 
     if world_size > 1 and dist.is_initialized():

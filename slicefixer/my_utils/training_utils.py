@@ -105,7 +105,7 @@ def parse_args_paired_training(input_args=None):
     parser.add_argument(
         "--slice_context_radius",
         type=int,
-        default=0,
+        default=2,
         help="Number of neighboring axial slices to condition on each side. Use 2 for five-slice 2.5D input.",
     )
     parser.add_argument(

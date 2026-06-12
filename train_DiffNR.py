@@ -122,7 +122,11 @@ def get_diffusion_cache_path(opt, model_path):
 
 def load_checkpoint_on_current_device(checkpoint):
     current_device = torch.cuda.current_device()
-    return torch.load(checkpoint, map_location=lambda storage, loc: storage.cuda(current_device))
+    return torch.load(
+        checkpoint,
+        map_location=lambda storage, loc: storage.cuda(current_device),
+        weights_only=False,
+    )
 
 def move_gaussians_to_current_device(gaussians):
     device = torch.device("cuda", torch.cuda.current_device())

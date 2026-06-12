@@ -12,7 +12,7 @@ if [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
 fi
 
 CASE_ID=${CASE_ID-"1.3.6.1.4.1.9328.50.4.0001"}
-RUN_NAME=${RUN_NAME-"SliceFixer_0001_rad_dino_2p5d_spinemask_fromscratch_cache8_noclip_l2x2_gan01_lr1e5_8gpu_bs1_acc4_eb16_eval500_val100_uncondgan"}
+RUN_NAME=${RUN_NAME-"SliceFixer_0001_rad_dino_2p5d_nomask_fromscratch_cache8_noclip_l2x2_gan01_lr1e5_8gpu_bs1_acc4_eb16_eval500_val100_uncondgan"}
 
 DATASET_ROOT=${DATASET_ROOT-/root/epfs/data}
 INFO_JSON=${INFO_JSON-/root/epfs/DiffNR/info_slicefixer_0001.json}
@@ -23,8 +23,8 @@ INITIAL_GLOBAL_STEP=${INITIAL_GLOBAL_STEP-0}
 NPROC_PER_NODE=${NPROC_PER_NODE-8}
 MAIN_PROCESS_PORT=${MAIN_PROCESS_PORT-29501}
 SLICE_CONTEXT_RADIUS=${SLICE_CONTEXT_RADIUS-2}
-USE_MASK_CONDITIONING=${USE_MASK_CONDITIONING-1}
-REQUIRE_MASK_CONDITIONING=${REQUIRE_MASK_CONDITIONING-1}
+USE_MASK_CONDITIONING=${USE_MASK_CONDITIONING-0}
+REQUIRE_MASK_CONDITIONING=${REQUIRE_MASK_CONDITIONING-0}
 MASK_RELPATH=${MASK_RELPATH-mask}
 export WANDB_MODE=${WANDB_MODE-online}
 
@@ -62,7 +62,7 @@ if [ "$USE_MASK_CONDITIONING" = "1" ]; then
     --mask_relpath "$MASK_RELPATH"
   )
 fi
-if [ "$REQUIRE_MASK_CONDITIONING" = "1" ]; then
+if [ "$USE_MASK_CONDITIONING" = "1" ] && [ "$REQUIRE_MASK_CONDITIONING" = "1" ]; then
   conditioning_args+=(--require_mask_conditioning)
 fi
 
