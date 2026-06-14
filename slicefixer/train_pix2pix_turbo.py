@@ -162,11 +162,39 @@ def _npz_key(path):
         return stem if stem in data.files else data.files[0]
 
 
+def _is_nifti_path(path):
+    return str(path).lower().endswith((".nii", ".nii.gz"))
+
+
+def _slice_key(path):
+    name = Path(path).name
+    for suffix in (".nii.gz", ".npz", ".npy", ".nii"):
+        if name.endswith(suffix):
+            return name[: -len(suffix)]
+    return Path(path).stem
+
+
+def _load_nifti_slice(path):
+    try:
+        import SimpleITK as sitk
+    except Exception as exc:
+        raise ImportError("SimpleITK is required to read .nii/.nii.gz slice files.") from exc
+    arr = sitk.GetArrayFromImage(sitk.ReadImage(str(path)))
+    arr = np.asarray(arr)
+    if arr.ndim == 3 and 1 in arr.shape:
+        arr = np.squeeze(arr)
+    if arr.ndim != 2:
+        raise ValueError(f"Expected 2D NIfTI slice at {path}, got shape {arr.shape}.")
+    return arr
+
+
 def _load_array_file(path, key=None):
     if path.endswith(".npz"):
         with np.load(path) as data:
             array_key = key or (Path(path).stem if Path(path).stem in data.files else data.files[0])
             return data[array_key]
+    if _is_nifti_path(path):
+        return _load_nifti_slice(path)
     return np.load(path)
 
 
@@ -182,22 +210,35 @@ def get_volume_info(path):
             )
         return tuple(shape), dtype, key
 
+    if _is_nifti_path(path):
+        try:
+            import SimpleITK as sitk
+        except Exception as exc:
+            raise ImportError("SimpleITK is required to read .nii/.nii.gz slice files.") from exc
+        reader = sitk.ImageFileReader()
+        reader.SetFileName(str(path))
+        reader.ReadImageInformation()
+        return tuple(reader.GetSize()), np.dtype(np.float32), None
+
     arr = np.load(path, mmap_mode="r")
     return arr.shape, arr.dtype, None
 
 
 def _slice_files(slice_dir):
     paths = {}
-    for suffix in ("*.npz", "*.npy"):
-        for path in Path(slice_dir).glob(suffix):
-            if path.is_file():
-                paths[path.name] = str(path)
+    with os.scandir(slice_dir) as entries:
+        for entry in entries:
+            if not entry.is_file():
+                continue
+            name = entry.name
+            if name.endswith((".npz", ".npy", ".nii", ".nii.gz")):
+                paths[_slice_key(name)] = entry.path
     return paths
 
 
 def _slice_manifest_cache_valid(payload, case_paths, use_mask_conditioning, mask_relpath, require_mask_conditioning):
     return (
-        payload.get("version") == 1
+        payload.get("version") == 2
         and payload.get("case_paths") == [str(p) for p in case_paths]
         and payload.get("use_mask_conditioning") == bool(use_mask_conditioning)
         and payload.get("mask_relpath") == str(mask_relpath)
@@ -240,7 +281,7 @@ def _build_slice_manifest(case_paths, use_mask_conditioning=False, mask_relpath=
             continue
 
         if use_mask_conditioning and mask_dir is not None:
-            first_mask_path = os.path.join(mask_dir, first_slice_name)
+            first_mask_path = mask_files[first_slice_name]
             first_mask_shape, _, _ = get_volume_info(first_mask_path)
             if len(first_mask_shape) != 2 or tuple(first_mask_shape) != tuple(first_coarse_shape):
                 if require_mask_conditioning:
@@ -252,6 +293,9 @@ def _build_slice_manifest(case_paths, use_mask_conditioning=False, mask_relpath=
             "pred_dir": pred_dir,
             "gt_dir": gt_dir,
             "mask_dir": mask_dir,
+            "pred_files": pred_files,
+            "gt_files": gt_files,
+            "mask_files": mask_files if mask_dir is not None else None,
         }
     return manifest
 
@@ -286,7 +330,7 @@ def load_or_build_slice_manifest(
         require_mask_conditioning=require_mask_conditioning,
     )
     payload = {
-        "version": 1,
+        "version": 2,
         "case_paths": [str(p) for p in case_paths],
         "use_mask_conditioning": bool(use_mask_conditioning),
         "mask_relpath": str(mask_relpath),
@@ -394,13 +438,15 @@ class MedicalCTDataset(torch.utils.data.Dataset):
                 pred_dir = slice_manifest["pred_dir"]
                 gt_dir = slice_manifest["gt_dir"]
                 mask_dir = slice_manifest.get("mask_dir")
-                pred_files = {name: os.path.join(pred_dir, name) for name in slice_names}
-                gt_files = {name: os.path.join(gt_dir, name) for name in slice_names}
-                mask_files = (
-                    {name: os.path.join(mask_dir, name) for name in slice_names}
-                    if self.use_mask_conditioning and mask_dir is not None
-                    else None
-                )
+                pred_files = slice_manifest.get("pred_files") or {
+                    name: os.path.join(pred_dir, name) for name in slice_names
+                }
+                gt_files = slice_manifest.get("gt_files") or {
+                    name: os.path.join(gt_dir, name) for name in slice_names
+                }
+                mask_files = slice_manifest.get("mask_files")
+                if mask_files is None and self.use_mask_conditioning and mask_dir is not None:
+                    mask_files = {name: os.path.join(mask_dir, name) for name in slice_names}
                 case_conditioning["mask_files"] = mask_files
                 self._volume_info[case_path] = case_conditioning
                 self._slice_case_info[case_path] = {

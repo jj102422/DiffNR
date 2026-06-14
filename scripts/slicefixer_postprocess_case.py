@@ -81,11 +81,37 @@ def load_npz_key(path, preferred_key):
 
 def slice_files(slice_dir):
     paths = {}
-    for suffix in ("*.npz", "*.npy"):
+    for suffix in ("*.npz", "*.npy", "*.nii", "*.nii.gz", "*.mha", "*.mhd"):
         for path in Path(slice_dir).glob(suffix):
             if path.is_file():
                 paths[path.name] = path
+                if path.name.startswith("axial_"):
+                    slice_id = path.name.split(".", 1)[0]
+                    paths.setdefault(f"{slice_id}.npz", path)
+                    paths.setdefault(f"{slice_id}.npy", path)
     return paths
+
+
+def load_mask_slice(path, preferred_key=None):
+    path = Path(path)
+    suffixes = "".join(path.suffixes).lower()
+    if suffixes.endswith(".nii") or suffixes.endswith(".nii.gz"):
+        try:
+            arr = np.asanyarray(nib.load(str(path)).dataobj)
+        except Exception:
+            import SimpleITK as sitk
+
+            arr = sitk.GetArrayFromImage(sitk.ReadImage(str(path)))
+    elif suffixes.endswith(".mha") or suffixes.endswith(".mhd"):
+        import SimpleITK as sitk
+
+        arr = sitk.GetArrayFromImage(sitk.ReadImage(str(path)))
+    else:
+        arr = load_npz_key(path, preferred_key)
+    arr = np.squeeze(np.asarray(arr))
+    if arr.ndim != 2:
+        raise ValueError(f"Expected 2D mask slice, got shape={arr.shape} from {path}")
+    return (arr > 0).astype(np.float32)
 
 
 def load_xray_feature(path, device):
@@ -314,7 +340,7 @@ def main():
                 if mask_files is not None:
                     mask_stack = np.stack(
                         [
-                            (load_npz_key(mask_files[pred_paths[pos].name], args.mask_key) > 0).astype(np.float32)
+                            load_mask_slice(mask_files[pred_paths[pos].name], args.mask_key)
                             for pos in context_positions
                         ],
                         axis=0,

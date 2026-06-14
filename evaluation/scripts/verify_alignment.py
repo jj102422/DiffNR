@@ -11,9 +11,9 @@ if str(ROOT) not in sys.path:
 
 from evaluation.scripts.evaluate_all import failure_row
 from evaluation.src.align import prepare_case_for_metric
-from evaluation.src.config_io import load_yaml, resolve_model_names
+from evaluation.src.config_io import load_yaml, normalize_global_config, normalize_model_diet_config, resolve_model_names
 from evaluation.src.report import DEBUG_COLUMNS, FAILED_COLUMNS, output_dir_from_config, save_csv
-from evaluation.src.visualization import save_visual_check
+from evaluation.src.visualization import save_three_plane_check, save_visual_check
 
 
 def parse_args() -> argparse.Namespace:
@@ -28,8 +28,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    global_cfg = load_yaml(args.eval_config)
-    model_diet_all = load_yaml(args.model_diet)
+    global_cfg = normalize_global_config(load_yaml(args.eval_config))
+    model_diet_all = normalize_model_diet_config(load_yaml(args.model_diet))
     model_names = resolve_model_names(args.models, model_diet_all)
     output_dir = output_dir_from_config(global_cfg, args.output_dir)
 
@@ -51,6 +51,15 @@ def main() -> None:
                     ct_min=float(global_cfg["canonical"]["ct_min"]),
                     ct_max=float(global_cfg["canonical"]["ct_max"]),
                 )
+                save_three_plane_check(
+                    gt,
+                    pred,
+                    mask,
+                    output_dir / "three_plane_compare" / model_name / f"{case_id}.png",
+                    ct_min=float(global_cfg.get("eval", {}).get("debug", {}).get("window_vmin", global_cfg["canonical"]["ct_min"])),
+                    ct_max=float(global_cfg.get("eval", {}).get("debug", {}).get("window_vmax", global_cfg["canonical"]["ct_max"])),
+                    title_extra=f"{model_name} {case_id} {debug.get('alignment_quality', '')}",
+                )
                 print(f"[ok] {model_name} {case_id}: gt={gt.shape} pred={pred.shape} mask_voxels={int(mask.sum())}")
             except Exception as exc:
                 row = failure_row(model_name, case_id, exc)
@@ -63,4 +72,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

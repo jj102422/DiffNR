@@ -15,13 +15,15 @@ from evaluation.src.config_io import (
     load_excel_config,
     load_yaml,
     merge_excel_config,
+    normalize_global_config,
+    normalize_model_diet_config,
     read_test_list,
     resolve_model_names,
 )
 from evaluation.src.lpips_metric import LPIPSMetric
 from evaluation.src.metrics import metric
 from evaluation.src.report import output_dir_from_config, print_markdown_summary, save_standard_outputs, summarize_metrics
-from evaluation.src.visualization import save_visual_check
+from evaluation.src.visualization import save_three_plane_check, save_visual_check
 
 
 def parse_args() -> argparse.Namespace:
@@ -38,8 +40,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    global_cfg = load_yaml(args.eval_config)
-    model_diet_all = load_yaml(args.model_diet)
+    global_cfg = normalize_global_config(load_yaml(args.eval_config))
+    model_diet_all = normalize_model_diet_config(load_yaml(args.model_diet))
     if args.excel_config:
         model_diet_all = merge_excel_config(model_diet_all, load_excel_config(args.excel_config))
 
@@ -69,9 +71,21 @@ def main() -> None:
         for case_id in test_cases:
             try:
                 gt, pred, mask, debug = prepare_case_for_metric(case_id, model_name, global_cfg, model_cfg)
-                result = metric(gt, pred, mask, Diet)
-                rows.append({"model": model_name, "case_id": case_id, **result})
                 debug_rows.append({"model": model_name, "case_id": case_id, **debug})
+                if not model_cfg.get("allow_metric", True):
+                    continue
+                result = metric(gt, pred, mask, Diet)
+                rows.append(
+                    {
+                        "model": model_name,
+                        "case_id": case_id,
+                        **result,
+                        "alignment_quality": debug.get("alignment_quality"),
+                        "allow_metric": debug.get("allow_metric"),
+                        "warnings": debug.get("warnings", ""),
+                        "notes": debug.get("notes", ""),
+                    }
+                )
                 if save_visual and visual_counts[model_name] < 1:
                     out_path = output_dir / "visual_check" / model_name / f"{case_id}_axial.png"
                     save_visual_check(
@@ -82,6 +96,16 @@ def main() -> None:
                         num_slices=visual_limit,
                         ct_min=float(global_cfg["canonical"]["ct_min"]),
                         ct_max=float(global_cfg["canonical"]["ct_max"]),
+                    )
+                    three_plane_path = output_dir / "three_plane_compare" / model_name / f"{case_id}.png"
+                    save_three_plane_check(
+                        gt,
+                        pred,
+                        mask,
+                        three_plane_path,
+                        ct_min=float(global_cfg.get("eval", {}).get("debug", {}).get("window_vmin", global_cfg["canonical"]["ct_min"])),
+                        ct_max=float(global_cfg.get("eval", {}).get("debug", {}).get("window_vmax", global_cfg["canonical"]["ct_max"])),
+                        title_extra=f"{model_name} {case_id} {debug.get('alignment_quality', '')}",
                     )
                     visual_counts[model_name] += 1
             except Exception as exc:
@@ -103,13 +127,13 @@ def failure_row(model_name: str, case_id: str, exc: Exception) -> dict:
             "case_id": case_id,
             "stage": exc.stage,
             "error": repr(exc),
+            "error_message": str(exc),
             "gt_path": exc.paths.gt_path,
             "pred_path": exc.paths.pred_path,
             "mask_path": exc.paths.mask_path,
         }
-    return {"model": model_name, "case_id": case_id, "stage": "unknown", "error": repr(exc)}
+    return {"model": model_name, "case_id": case_id, "stage": "unknown", "error": repr(exc), "error_message": str(exc)}
 
 
 if __name__ == "__main__":
     main()
-

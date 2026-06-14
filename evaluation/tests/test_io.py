@@ -75,3 +75,50 @@ def test_missing_pred_reports_stage(tmp_path):
     with pytest.raises(StageError) as exc:
         prepare_case_for_metric(case, "m", global_cfg, model_cfg)
     assert exc.value.stage == "load_pred"
+
+
+def test_prepare_case_accepts_model_diet_spec_schema(tmp_path):
+    case = "case001"
+    gt = np.arange(8, dtype=np.float32).reshape(2, 2, 2)
+    pred_xyz = np.transpose(gt / 2500.0, (2, 1, 0))
+    mask = np.ones_like(gt, dtype=np.uint8)
+    np.save(tmp_path / "gt.npy", gt)
+    np.save(tmp_path / "mask.npy", mask)
+    np.save(tmp_path / "pred.npy", pred_xyz)
+
+    global_cfg = {
+        "dataset": {
+            "eval_gt_root": str(tmp_path),
+            "eval_gt_type": "npy",
+            "eval_gt_pattern": "gt.npy",
+            "eval_gt_axis_order": "ZYX",
+            "eval_mask_root": str(tmp_path),
+            "eval_mask_type": "npy",
+            "eval_mask_pattern": "mask.npy",
+            "eval_mask_axis_order": "ZYX",
+        },
+        "eval": {
+            "reference_space": "canonical_gt",
+            "intensity": {"clip_for_metric": [0, 2500], "norm_min": 0, "norm_max": 2500},
+            "mask": {"binarize_threshold": 0},
+        },
+    }
+    model_cfg = {
+        "pred_path_pattern": str(tmp_path / "pred.npy"),
+        "pred_format": "npy",
+        "read_backend": "numpy",
+        "pred_axis_order_in_file": "XYZ",
+        "transpose_order": [2, 1, 0],
+        "flip_axes": [],
+        "inverse_intensity": {"type": "affine", "formula": "pred_hu = clip(pred, 0, 1) * 2500"},
+        "spatial_align": {"method": "identity", "interpolation": "linear"},
+        "allow_metric": True,
+        "alignment_quality": "verified",
+    }
+
+    gt_out, pred_out, mask_out, debug = prepare_case_for_metric(case, "m", global_cfg, model_cfg)
+    assert np.array_equal(gt_out, gt)
+    assert np.array_equal(pred_out, gt)
+    assert mask_out.dtype == np.bool_
+    assert debug["pred_after_axis_shape"] == "2x2x2"
+    assert debug["alignment_quality"] == "verified"

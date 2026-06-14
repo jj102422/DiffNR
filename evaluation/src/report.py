@@ -15,12 +15,15 @@ PER_CASE_COLUMNS = [
     "SSIM",
     "LPIPS",
     "mask_voxels",
+    "alignment_quality",
+    "allow_metric",
+    "warnings",
     "mse_norm_mask",
     "valid_ssim_slices",
     "valid_lpips_slices",
 ]
 
-FAILED_COLUMNS = ["model", "case_id", "stage", "error", "gt_path", "pred_path", "mask_path"]
+FAILED_COLUMNS = ["model", "case_id", "stage", "error", "error_message", "gt_path", "pred_path", "mask_path"]
 
 DEBUG_COLUMNS = [
     "model",
@@ -28,6 +31,12 @@ DEBUG_COLUMNS = [
     "gt_path",
     "pred_path",
     "mask_path",
+    "reference_gt_source",
+    "gt_shape",
+    "mask_shape",
+    "pred_raw_shape",
+    "pred_after_axis_shape",
+    "pred_final_shape",
     "gt_shape_raw",
     "pred_shape_raw",
     "mask_shape_raw",
@@ -38,20 +47,39 @@ DEBUG_COLUMNS = [
     "mask_shape_after_align",
     "gt_min",
     "gt_max",
+    "gt_p1",
+    "gt_p99",
+    "pred_min",
+    "pred_max",
+    "pred_p1",
+    "pred_p99",
     "pred_min_raw",
     "pred_max_raw",
     "pred_min_after_intensity",
     "pred_max_after_intensity",
     "mask_voxels",
+    "output_domain",
+    "inverse_intensity_formula",
+    "fill_value_hu",
+    "transpose_order",
     "align_strategy",
+    "spatial_align_method",
+    "z_mode",
+    "z_offset",
     "transpose",
+    "rot90",
     "flip_axes",
+    "intensity_transform",
     "norm_min",
     "norm_max",
     "canonical_ct_min",
     "canonical_ct_max",
     "projector",
     "train_gt_source",
+    "allow_metric",
+    "alignment_quality",
+    "notes",
+    "warnings",
 ]
 
 
@@ -83,7 +111,7 @@ def summarize_metrics(rows: list[dict], model_order: Iterable[str] | None = None
     summary_rows = []
     df = pd.DataFrame(rows)
     if df.empty:
-        return pd.DataFrame(columns=["model", "n_cases", *[f"{m}_{s}" for m in metric_names for s in ["mean", "std"]]])
+        return pd.DataFrame(columns=["model", "num_cases", "n_cases", *[f"{m}_{s}" for m in metric_names for s in ["mean", "std"]]])
 
     ordered = list(model_order or [])
     for model in df["model"].drop_duplicates().tolist():
@@ -94,7 +122,13 @@ def summarize_metrics(rows: list[dict], model_order: Iterable[str] | None = None
         g = df[df["model"] == model]
         if g.empty:
             continue
-        row = {"model": model, "n_cases": int(len(g))}
+        row = {
+            "model": model,
+            "num_cases": int(len(g)),
+            "n_cases": int(len(g)),
+            "alignment_quality": _join_unique(g.get("alignment_quality", [])),
+            "notes": _join_unique(g.get("notes", [])),
+        }
         for metric in metric_names:
             vals = pd.to_numeric(g[metric], errors="coerce")
             row[f"{metric}_mean"] = vals.mean()
@@ -148,3 +182,10 @@ def _fmt_mean_std(mean, std) -> str:
     except Exception:
         return "nan"
 
+
+def _join_unique(values) -> str:
+    try:
+        items = [str(v) for v in values if str(v) and str(v) != "nan"]
+    except Exception:
+        return ""
+    return "; ".join(dict.fromkeys(items))

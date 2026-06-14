@@ -16,7 +16,12 @@ def infer_file_type(path: str | Path, file_type: str | None = None) -> str:
     return suffix
 
 
-def load_volume(path: str | Path, file_type: str | None = None, key: str | None = None) -> np.ndarray:
+def load_volume(
+    path: str | Path,
+    file_type: str | None = None,
+    key: str | None = None,
+    read_backend: str | None = None,
+) -> np.ndarray:
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(str(path))
@@ -29,7 +34,7 @@ def load_volume(path: str | Path, file_type: str | None = None, key: str | None 
     elif kind in {"h5", "hdf5"}:
         arr = _load_h5(path, key)
     elif kind in {"nii", "nii.gz"}:
-        arr = _load_nifti(path)
+        arr = _load_nifti(path, read_backend=read_backend)
     elif kind in {"mha", "mhd"}:
         arr = _load_sitk(path)
     elif kind in {"pt", "pth"}:
@@ -83,12 +88,15 @@ def _load_h5(path: Path, key: str | None) -> np.ndarray:
         return f[key][()]
 
 
-def _load_nifti(path: Path) -> np.ndarray:
-    try:
-        import nibabel as nib
-    except ImportError:
-        return _load_sitk(path)
-    return np.asanyarray(nib.load(str(path)).dataobj)
+def _load_nifti(path: Path, read_backend: str | None = None) -> np.ndarray:
+    backend = (read_backend or "SimpleITK").lower()
+    if backend in {"nibabel", "nib"}:
+        try:
+            import nibabel as nib
+        except ImportError as exc:
+            raise RuntimeError("nibabel is required to read this NIfTI file.") from exc
+        return np.asarray(nib.load(str(path)).get_fdata(dtype=np.float32))
+    return _load_sitk(path)
 
 
 def _load_sitk(path: Path) -> np.ndarray:

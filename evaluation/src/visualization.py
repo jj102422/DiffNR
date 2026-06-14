@@ -50,6 +50,48 @@ def save_visual_check(
     plt.close(fig)
 
 
+def save_three_plane_check(
+    gt: np.ndarray,
+    pred: np.ndarray,
+    mask: np.ndarray,
+    out_path: str | Path,
+    ct_min: float = -1024.0,
+    ct_max: float = 1000.0,
+    title_extra: str = "",
+) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    z, y, x = choose_center_indices(mask)
+    err = np.abs(pred.astype(np.float32) - gt.astype(np.float32))
+    rows = [
+        ("GT", [gt[z], gt[:, y, :], gt[:, :, x]], ct_min, ct_max),
+        ("pred", [pred[z], pred[:, y, :], pred[:, :, x]], ct_min, ct_max),
+        ("abs error", [err[z], err[:, y, :], err[:, :, x]], 0.0, max(float(np.nanpercentile(err, 99)), 1.0)),
+    ]
+    fig, axes = plt.subplots(3, 3, figsize=(11, 9), squeeze=False)
+    for col, title in enumerate([f"axial z={z}", f"coronal y={y}", f"sagittal x={x}"]):
+        axes[0][col].set_title(title, fontsize=10)
+    for row_idx, (label, panels, vmin, vmax) in enumerate(rows):
+        for col_idx, img in enumerate(panels):
+            ax = axes[row_idx][col_idx]
+            ax.imshow(img, cmap="gray", vmin=vmin, vmax=vmax, aspect="equal")
+            ax.axis("off")
+            if col_idx == 0:
+                ax.text(-0.08, 0.5, label, transform=ax.transAxes, ha="right", va="center", fontsize=9)
+    if title_extra:
+        fig.suptitle(title_extra, fontsize=10)
+        fig.tight_layout(rect=(0.08, 0.02, 1, 0.96))
+    else:
+        fig.tight_layout(rect=(0.08, 0.02, 1, 1))
+    fig.savefig(out_path, dpi=160)
+    plt.close(fig)
+
+
 def choose_mask_slices(mask: np.ndarray, num_slices: int = 5) -> list[int]:
     counts = mask.reshape(mask.shape[0], -1).sum(axis=1)
     valid = np.where(counts > 0)[0]
@@ -60,3 +102,9 @@ def choose_mask_slices(mask: np.ndarray, num_slices: int = 5) -> list[int]:
         positions = np.linspace(0, len(valid) - 1, num=min(num_slices, len(valid)), dtype=int)
         picks.update(int(valid[pos]) for pos in positions)
     return sorted(picks)[:num_slices]
+
+
+def choose_center_indices(mask: np.ndarray) -> tuple[int, int, int]:
+    coords = np.argwhere(mask)
+    center = np.array(mask.shape) // 2 if coords.size == 0 else np.round(np.median(coords, axis=0)).astype(int)
+    return tuple(max(0, min(int(idx), int(size) - 1)) for idx, size in zip(center, mask.shape))
