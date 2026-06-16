@@ -5,6 +5,22 @@ import argparse
 import sys
 from pathlib import Path
 
+try:
+    from tqdm import tqdm
+except ImportError:  # tqdm 缺失时退化为恒等包装, 不影响评估
+    def tqdm(iterable=None, **kwargs):
+        return iterable if iterable is not None else _NullBar()
+
+    class _NullBar:
+        def update(self, *_):
+            pass
+
+        def set_postfix_str(self, *_):
+            pass
+
+        def close(self):
+            pass
+
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -22,7 +38,12 @@ from evaluation.src.config_io import (
 )
 from evaluation.src.lpips_metric import LPIPSMetric
 from evaluation.src.metrics import metric
-from evaluation.src.report import output_dir_from_config, print_markdown_summary, save_standard_outputs, summarize_metrics
+from evaluation.src.report import (
+    output_dir_from_config,
+    print_markdown_summary,
+    save_standard_outputs,
+    summarize_metrics,
+)
 from evaluation.src.visualization import save_three_plane_check, save_visual_check
 
 
@@ -63,12 +84,15 @@ def main() -> None:
     visual_limit = int(global_cfg.get("runtime", {}).get("visual_check_num_slices", 5))
     save_visual = bool(global_cfg.get("runtime", {}).get("save_visual_check", True)) and not args.no_visual_check
 
+    enabled_models = [m for m in model_names if model_diet_all["models"][m].get("enabled", True)]
+    progress = tqdm(total=len(enabled_models) * len(test_cases), desc="eval", unit="case")
     for model_name in model_names:
         model_cfg = model_diet_all["models"][model_name]
         if not model_cfg.get("enabled", True):
             continue
         Diet = build_runtime_diet(global_cfg, model_cfg, lpips_runner=lpips_runner)
         for case_id in test_cases:
+            progress.set_postfix_str(f"{model_name} {case_id}")
             try:
                 gt, pred, mask, debug = prepare_case_for_metric(case_id, model_name, global_cfg, model_cfg)
                 debug_rows.append({"model": model_name, "case_id": case_id, **debug})
@@ -114,7 +138,10 @@ def main() -> None:
                 save_standard_outputs(rows, debug_rows, failed_rows, global_cfg, output_dir, model_order=model_names)
                 if not allow_missing:
                     raise
+            finally:
+                progress.update(1)
 
+    progress.close()
     save_standard_outputs(rows, debug_rows, failed_rows, global_cfg, output_dir, model_order=model_names)
     summary = summarize_metrics(rows, model_order=model_names)
     print_markdown_summary(summary)

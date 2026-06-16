@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 from glob import glob
 from pathlib import Path
 from typing import Any
@@ -10,6 +11,21 @@ import numpy as np
 from .config_io import normalize_global_config
 from .mask_ops import as_bool_mask, resize_mask_to_shape
 from .volume_io import load_volume
+
+
+@lru_cache(maxsize=4)
+def _load_volume_cached(path: str, file_type: str | None, key: str | None, read_backend: str | None) -> np.ndarray:
+    """按路径缓存原始体积加载。GT/mask 对同一 case 的所有 model 完全相同, 用它避免重复读盘/解码。
+
+    maxsize=4 仅缓存最近一个 case 的 GT+mask(各 1 项), 内存有界; 多 model 单 case(如
+    visualize_case_planes.py)可命中, 把 N 次读取降为 1 次。调用方需 .copy() 后再使用,
+    以免就地修改污染缓存。
+    """
+    return load_volume(path, file_type=file_type, key=key, read_backend=read_backend)
+
+
+def clear_volume_cache() -> None:
+    _load_volume_cached.cache_clear()
 
 
 @dataclass
@@ -44,12 +60,12 @@ def prepare_case_for_metric(
     }
     try:
         paths.gt_path = resolve_gt_path(case_id, global_cfg)
-        gt = load_volume(
+        gt = _load_volume_cached(
             paths.gt_path,
-            file_type=global_cfg["dataset"].get("eval_gt_type"),
-            key=global_cfg["dataset"].get("eval_gt_h5_key"),
-            read_backend=global_cfg["dataset"].get("eval_gt_read_backend"),
-        )
+            global_cfg["dataset"].get("eval_gt_type"),
+            global_cfg["dataset"].get("eval_gt_h5_key"),
+            global_cfg["dataset"].get("eval_gt_read_backend"),
+        ).copy()
         gt = apply_axis_order_to_zyx(gt, global_cfg["dataset"].get("eval_gt_axis_order", "ZYX"))
         gt = gt.astype(np.float32, copy=False)
         debug.update(volume_stats("gt", gt))
@@ -60,11 +76,11 @@ def prepare_case_for_metric(
 
     try:
         paths.mask_path = resolve_mask_path(case_id, global_cfg)
-        mask = load_volume(
+        mask = _load_volume_cached(
             paths.mask_path,
-            file_type=global_cfg["dataset"].get("eval_mask_type"),
-            key=global_cfg["dataset"].get("eval_mask_key"),
-            read_backend=global_cfg["dataset"].get("eval_mask_read_backend"),
+            global_cfg["dataset"].get("eval_mask_type"),
+            global_cfg["dataset"].get("eval_mask_key"),
+            global_cfg["dataset"].get("eval_mask_read_backend"),
         )
         mask = apply_axis_order_to_zyx(mask, global_cfg["dataset"].get("eval_mask_axis_order", "ZYX"))
         threshold = mask_threshold(global_cfg)
@@ -96,6 +112,8 @@ def prepare_case_for_metric(
             pred = reshape_with_placeholders(pred, pred_cfg["reshape_to"], gt.shape)
 
         pred = apply_axis_transform(pred, pred_cfg)
+        pred = apply_pred_xy_transpose(pred, model_name, model_diet, global_cfg)
+        pred = apply_pred_x_flip(pred, model_name, model_diet, global_cfg)
         debug["pred_shape_after_axis"] = shape_text(pred.shape)
         debug["pred_after_axis_shape"] = shape_text(pred.shape)
     except Exception as exc:
@@ -127,6 +145,7 @@ def prepare_case_for_metric(
         debug["mask_shape_after_align"] = shape_text(mask.shape)
         debug["mask_shape"] = shape_text(mask.shape)
         debug["mask_voxels"] = int(mask.sum())
+        gt, pred, mask = apply_z_flip_all(gt, pred, mask, global_cfg)
         if gt.shape != pred.shape or gt.shape != mask.shape:
             raise ValueError(f"Shape mismatch after align: gt={gt.shape}, pred={pred.shape}, mask={mask.shape}")
     except Exception as exc:
@@ -356,6 +375,42 @@ def apply_axis_order_to_zyx(arr: np.ndarray, axis_order: str | None) -> np.ndarr
         order = [normalized.index(axis) for axis in "ZYX"]
         return np.transpose(arr, order)
     return arr
+
+
+def geometry_fix_cfg(global_cfg: dict[str, Any]) -> dict[str, Any]:
+    """统一的几何修正配置(顶层 geometry_fix 块), 供 GT 与所有 pred 共用, 两个脚本都生效。"""
+    return global_cfg.get("geometry_fix", {}) or {}
+
+
+def _model_matches(model_name: str, model_diet: dict[str, Any], names: set[str]) -> bool:
+    if model_name in names:
+        return True
+    return any(alias in names for alias in (model_diet.get("aliases") or []))
+
+
+def apply_pred_xy_transpose(pred: np.ndarray, model_name: str, model_diet: dict[str, Any], global_cfg: dict[str, Any]) -> np.ndarray:
+    """对指定 model 的 pred 做 axial 层内 X/Y 转置(交换 ZYX 的 1,2 轴)。在对齐到 GT 之前执行, 兼容非正方 XY。"""
+    names = set(geometry_fix_cfg(global_cfg).get("transpose_xy_models", []) or [])
+    if pred.ndim == 3 and _model_matches(model_name, model_diet, names):
+        pred = np.swapaxes(pred, 1, 2)
+    return np.ascontiguousarray(pred)
+
+
+def apply_pred_x_flip(pred: np.ndarray, model_name: str, model_diet: dict[str, Any], global_cfg: dict[str, Any]) -> np.ndarray:
+    """对指定 model 的 pred 做 X 轴(ZYX 的轴 2)翻转(axial 层内左右镜像)。在对齐到 GT 之前执行。"""
+    names = set(geometry_fix_cfg(global_cfg).get("flip_x_models", []) or [])
+    if pred.ndim == 3 and _model_matches(model_name, model_diet, names):
+        pred = np.flip(pred, axis=2)
+    return np.ascontiguousarray(pred)
+
+
+def apply_z_flip_all(gt: np.ndarray, pred: np.ndarray, mask: np.ndarray, global_cfg: dict[str, Any]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """对 GT/pred/mask 同步做 z 轴(轴 0)翻转。对逐体素指标是中性的(GT 与 pred 同翻), 仅修正显示朝向。"""
+    if geometry_fix_cfg(global_cfg).get("flip_z_all"):
+        gt = np.ascontiguousarray(np.flip(gt, axis=0))
+        pred = np.ascontiguousarray(np.flip(pred, axis=0))
+        mask = np.ascontiguousarray(np.flip(mask, axis=0))
+    return gt, pred, mask
 
 
 def restore_intensity(pred: np.ndarray, pred_cfg: dict[str, Any]) -> np.ndarray:

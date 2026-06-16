@@ -13,8 +13,41 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from evaluation.src.align import prepare_case_for_metric  # noqa: E402
-from evaluation.src.config_io import load_yaml, normalize_global_config, normalize_model_diet_config, resolve_model_names  # noqa: E402
+from evaluation.src.config_io import (  # noqa: E402
+    load_yaml,
+    normalize_global_config,
+    normalize_model_diet_config,
+    resolve_model_names,
+)
 from evaluation.src.report import output_dir_from_config  # noqa: E402
+
+# 论文用的规范化显示名(键为 model_diet 中的 model 名; 两套命名都覆盖)
+DISPLAY_NAME = {
+    "x2ct": "X2CT-GAN",
+    "raw_3DGS": "r²-Gaussian",
+    "3DGS_SliceFixer_post": "r²-Gaussian w/SliceFixer",
+    "3DGS_SliceFixer_iterative": "DiffNR",
+    "PerX2CT_SliceFixer_nomask": "PerX2CT w/SliceFixer",
+    "PerX2CT_SliceFixer_nomask_post": "PerX2CT w/SliceFixer",
+    "PerX2CT_SliceFixer_mask_full_ckpt": "PerX2CT w/SliceFixer++",
+}
+
+
+def display_name(model_name: str) -> str:
+    return DISPLAY_NAME.get(model_name, model_name)
+
+
+# 论文展示顺序微调: 互换这两个 model 的位置(DiffNR 排在 r²-Gaussian w/SliceFixer 之前)
+DISPLAY_SWAP_PAIRS = [("3DGS_SliceFixer_iterative", "3DGS_SliceFixer_post")]
+
+
+def reorder_for_display(names: list[str]) -> list[str]:
+    names = list(names)
+    for a, b in DISPLAY_SWAP_PAIRS:
+        if a in names and b in names:
+            ia, ib = names.index(a), names.index(b)
+            names[ia], names[ib] = names[ib], names[ia]
+    return names
 
 
 def parse_args() -> argparse.Namespace:
@@ -29,6 +62,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--x", type=int, default=None)
     parser.add_argument("--ct_min", type=float, default=None)
     parser.add_argument("--ct_max", type=float, default=None)
+    parser.add_argument("--transpose_layout", action="store_true", help="转置布局: 三视图为行、各 model 为列(图更宽更矮, 适合论文排版)")
+    parser.add_argument("--group_cols", type=int, default=None, help="转置布局下每组列数; 列超过该值则分成多组上下堆叠(组间加粗虚线分隔)")
     return parser.parse_args()
 
 
@@ -37,6 +72,8 @@ def main() -> None:
     global_cfg = normalize_global_config(load_yaml(args.eval_config))
     model_diet_all = normalize_model_diet_config(load_yaml(args.model_diet))
     model_names = resolve_model_names(args.models, model_diet_all)
+    if args.models is None:  # 仅在用默认配置顺序时应用展示顺序微调; 显式 --models 时尊重用户顺序
+        model_names = reorder_for_display(model_names)
     out_dir = output_dir_from_config(global_cfg, args.output_dir)
 
     gt = mask = None
@@ -50,14 +87,15 @@ def main() -> None:
             debug_rows.append({"model": model_name, **debug})
             if gt is None:
                 gt, mask = gt_i, mask_i
-                rows.append({"name": "GT", "model": "GT", "vol": gt_i, "debug": {}})
-            label = model_label(model_name, debug)
-            rows.append({"name": label, "model": model_name, "vol": pred_i, "debug": debug})
+            rows.append({"name": display_name(model_name), "model": model_name, "vol": pred_i, "debug": debug})
         except Exception as exc:
             failed.append((model_name, repr(exc)))
 
     if gt is None or mask is None:
         raise RuntimeError(f"No model loaded successfully for case {args.case_id}; failures={failed}")
+
+    # GT 放在最后(最右列/最后一行), 便于与最终模型对比
+    rows.append({"name": "GT", "model": "GT", "vol": gt, "debug": {}})
 
     three_plane_cfg = global_cfg.get("runtime", {}).get("three_plane_compare", {})
     rows, mask, crop_note = apply_display_crop_z(rows, mask, debug_rows, three_plane_cfg)
@@ -66,6 +104,9 @@ def main() -> None:
     ct_min = float(args.ct_min if args.ct_min is not None else intensity_cfg.get("window_vmin", global_cfg["canonical"]["ct_min"]))
     ct_max = float(args.ct_max if args.ct_max is not None else intensity_cfg.get("window_vmax", global_cfg["canonical"]["ct_max"]))
     rows = apply_display_intensity(rows, mask, intensity_cfg, default_background=ct_min)
+    per_row_window = bool(intensity_cfg.get("per_row_window", False))
+    transpose_layout = bool(args.transpose_layout or three_plane_cfg.get("transpose_layout", False))
+    group_cols = args.group_cols if args.group_cols is not None else three_plane_cfg.get("group_cols")
     out_path = out_dir / "three_plane_compare" / f"{args.case_id}.png"
     save_three_plane_grid(
         rows,
@@ -78,6 +119,9 @@ def main() -> None:
         failed=failed,
         plane_cfg=three_plane_cfg,
         crop_note=crop_note,
+        per_row_window=per_row_window,
+        transpose_layout=transpose_layout,
+        group_cols=group_cols,
     )
     print(f"[ok] wrote {out_path}")
     print(f"slices: axial z={z}, coronal y={y}, sagittal x={x}")
@@ -116,47 +160,87 @@ def save_three_plane_grid(
     failed: list[tuple[str, str]],
     plane_cfg: dict[str, Any],
     crop_note: str,
+    per_row_window: bool = False,
+    transpose_layout: bool = False,
+    group_cols: int | None = None,
 ) -> None:
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    n_rows = len(rows) + (1 if failed else 0)
-    fig_h = max(2.1 * n_rows, 8)
-    fig, axes = plt.subplots(n_rows, 3, figsize=(12.0, fig_h), squeeze=False)
-    titles = [f"axial z={z}", f"coronal y={y}", f"sagittal x={x}"]
-    for col, title in enumerate(titles):
-        axes[0][col].set_title(title, fontsize=11)
+    planes = ("axial", "coronal", "sagittal")
 
-    for row_idx, row in enumerate(rows):
+    # 预计算每个 model 的窗位与三视图面板
+    entries: list[dict[str, Any]] = []
+    for row in rows:
         name = str(row["name"])
         model = str(row["model"])
         vol = row["vol"]
         p1, p99 = robust_range(vol)
-        row_label = f"{name}\np1-p99 [{p1:.0f},{p99:.0f}]"
-        panels = [make_plane(vol, z, y, x, plane_cfg, model, plane) for plane in ("axial", "coronal", "sagittal")]
-        for col_idx, img in enumerate(panels):
-            ax = axes[row_idx][col_idx]
-            ax.imshow(img, cmap="gray", vmin=ct_min, vmax=ct_max, aspect="equal")
-            ax.axis("off")
-            if col_idx == 0:
-                ax.text(-0.12, 0.5, row_label, transform=ax.transAxes, ha="right", va="center", fontsize=8)
+        # 每个 model 用自身 p1-p99 做窗位, 解决各 model 与 GT 强度量级不同导致过暗/过亮
+        if per_row_window and np.isfinite(p1) and np.isfinite(p99) and p99 > p1:
+            vmin, vmax = p1, p99
+        else:
+            vmin, vmax = ct_min, ct_max
+        panels = {plane: make_plane(vol, z, y, x, plane_cfg, model, plane) for plane in planes}
+        entries.append({"name": name, "p1": p1, "p99": p99, "vmin": vmin, "vmax": vmax, "panels": panels})
 
-    if failed:
-        row_idx = len(rows)
-        for col_idx in range(3):
-            axes[row_idx][col_idx].axis("off")
-        text = "\n".join(f"{model}: failed" for model, _ in failed)
-        axes[row_idx][0].text(0.0, 0.5, text, fontsize=9, va="center")
+    if transpose_layout:
+        # 转置: 三视图为行, 各 model 为列; 列数超过 group_cols 时分多组上下堆叠
+        n_total = max(len(entries), 1)
+        gc = int(group_cols) if group_cols else n_total
+        gc = max(1, gc)
+        n_groups = max(1, (n_total + gc - 1) // gc)
+        n_cols = min(gc, n_total)
+        fig_w = max(2.3 * n_cols, 8.0)
+        fig_h = max(2.5 * 3 * n_groups, 6.0)
+        fig = plt.figure(figsize=(fig_w, fig_h))
+        subfigs = fig.subfigures(n_groups, 1, hspace=0.01) if n_groups > 1 else [fig.subfigures(1, 1)]
+        for g in range(n_groups):
+            sf = subfigs[g]
+            group_entries = entries[g * gc : (g + 1) * gc]
+            axes = sf.subplots(3, n_cols, squeeze=False)
+            for c in range(n_cols):
+                for r in range(3):
+                    axes[r][c].axis("off")
+                if c < len(group_entries):
+                    e = group_entries[c]
+                    axes[0][c].set_title(e["name"], fontsize=10)
+                    for r_idx, plane in enumerate(planes):
+                        axes[r_idx][c].imshow(e["panels"][plane], cmap="gray", vmin=e["vmin"], vmax=e["vmax"], aspect="equal")
+            sf.subplots_adjust(left=0.005, right=0.995, top=0.94, bottom=0.005, wspace=0.02, hspace=0.02)
+        # 组间粗虚线分隔
+        for g in range(1, n_groups):
+            y = 1.0 - g / n_groups
+            fig.add_artist(Line2D([0.02, 0.98], [y, y], transform=fig.transFigure,
+                                  color="black", linewidth=2.2, linestyle=(0, (6, 4))))
+        if failed:
+            fig.text(0.5, 0.002, "failed: " + ", ".join(model for model, _ in failed), ha="center", fontsize=8)
+    else:
+        # 原布局: 各 model 为行, 三视图为列
+        n_rows = len(entries) + (1 if failed else 0)
+        fig_h = max(2.1 * n_rows, 8)
+        fig, axes = plt.subplots(max(n_rows, 1), 3, figsize=(12.0, fig_h), squeeze=False)
+        for row_idx, e in enumerate(entries):
+            for col_idx, plane in enumerate(planes):
+                ax = axes[row_idx][col_idx]
+                ax.imshow(e["panels"][plane], cmap="gray", vmin=e["vmin"], vmax=e["vmax"], aspect="equal")
+                ax.axis("off")
+                if col_idx == 0:
+                    ax.text(-0.12, 0.5, e["name"], transform=ax.transAxes, ha="right", va="center", fontsize=9)
+        if failed:
+            row_idx = len(entries)
+            for col_idx in range(3):
+                axes[row_idx][col_idx].axis("off")
+            text = "\n".join(f"{model}: failed" for model, _ in failed)
+            axes[row_idx][0].text(0.0, 0.5, text, fontsize=9, va="center")
+        fig.subplots_adjust(left=0.16, right=0.999, top=0.999, bottom=0.005, wspace=0.02, hspace=0.04)
 
-    title = "GT-space three-plane comparison"
-    if crop_note:
-        title += f" ({crop_note})"
-    fig.suptitle(title, fontsize=13)
-    fig.tight_layout(rect=(0.18, 0.02, 1.0, 0.98))
-    fig.savefig(out_path, dpi=160)
+    fig.savefig(out_path, dpi=600, bbox_inches="tight", pad_inches=0.02)
+    fig.savefig(out_path.with_suffix(".pdf"), dpi=600, bbox_inches="tight", pad_inches=0.02)
     plt.close(fig)
 
 
