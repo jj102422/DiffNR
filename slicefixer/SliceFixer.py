@@ -11,6 +11,7 @@ from peft import LoraConfig
 p = "slicefixer/"
 sys.path.append(p)
 from model import make_1step_sched, my_vae_encoder_fwd, my_vae_decoder_fwd, CrossAttnFusionAdapter
+from spine_multitask import SpineMaskHead
 
 
 INTENSITY_DOMAIN = {
@@ -51,12 +52,17 @@ class SliceFixer(torch.nn.Module):
         sd_turbo_path=None,
         use_xray_conditioning=False,
         conditioning_in_channels=3,
+        enable_spine_head=False,
     ):
         super().__init__()
         loaded_sd = torch.load(pretrained_path, map_location="cpu") if pretrained_path is not None else None
         if loaded_sd is not None and conditioning_in_channels is None:
             conditioning_in_channels = loaded_sd.get("conditioning_in_channels", 3)
         self.conditioning_in_channels = int(conditioning_in_channels or 3)
+        self.spine_head_enabled = bool(
+            enable_spine_head or (loaded_sd or {}).get("spine_head_enabled", False)
+        )
+        self.training_metadata = {}
         self.use_xray_conditioning = use_xray_conditioning
         self.sd_turbo_path = (
             sd_turbo_path
@@ -94,6 +100,9 @@ class SliceFixer(torch.nn.Module):
         vae.decoder.skip_conv_3 = torch.nn.Conv2d(128, 512, kernel_size=(1, 1), stride=(1, 1), bias=False).cuda()
         vae.decoder.skip_conv_4 = torch.nn.Conv2d(128, 256, kernel_size=(1, 1), stride=(1, 1), bias=False).cuda()
         vae.decoder.ignore_skip = False
+        self.spine_mask_head = None
+        if self.spine_head_enabled:
+            self.spine_mask_head = SpineMaskHead(vae.decoder.conv_out.in_channels).cuda()
         unet = UNet2DConditionModel.from_pretrained(
             self.sd_turbo_path,
             subfolder="unet",
@@ -208,6 +217,12 @@ class SliceFixer(torch.nn.Module):
                     f"Initializing {self.conditioning_in_channels}->3 input adapter from center slice; "
                     "new context/mask channels are ignored until this adapter is fine-tuned."
                 )
+            if self.spine_head_enabled:
+                if "state_dict_mask_head" not in sd:
+                    raise ValueError(
+                        "Checkpoint declares a spine-mask head but does not contain state_dict_mask_head."
+                    )
+                self.spine_mask_head.load_state_dict(sd["state_dict_mask_head"])
             self.lora_rank_unet = sd["rank_unet"]
             self.lora_rank_vae = sd["rank_vae"]
             self.target_modules_vae = sd["vae_lora_target_modules"]
@@ -268,6 +283,9 @@ class SliceFixer(torch.nn.Module):
         self.fusion_adapter.requires_grad_(False)
         self.input_adapter.eval()
         self.input_adapter.requires_grad_(False)
+        if self.spine_mask_head is not None:
+            self.spine_mask_head.eval()
+            self.spine_mask_head.requires_grad_(False)
 
     def set_train(self):
         self.unet.train()
@@ -292,8 +310,22 @@ class SliceFixer(torch.nn.Module):
             self.fusion_adapter.requires_grad_(False)
         self.input_adapter.train()
         self.input_adapter.requires_grad_(True)
+        if self.spine_mask_head is not None:
+            self.spine_mask_head.train()
+            self.spine_mask_head.requires_grad_(True)
 
-    def forward(self, c_t, prompt=None, prompt_tokens=None, deterministic=True, r=1.0, noise_map=None, xray_feat1=None, xray_feat2=None):
+    def forward(
+        self,
+        c_t,
+        prompt=None,
+        prompt_tokens=None,
+        deterministic=True,
+        r=1.0,
+        noise_map=None,
+        xray_feat1=None,
+        xray_feat2=None,
+        return_mask=False,
+    ):
         # either the prompt or the prompt_tokens should be provided
         assert (prompt is None) != (prompt_tokens is None), "Either prompt or prompt_tokens should be provided"
 
@@ -345,9 +377,24 @@ class SliceFixer(torch.nn.Module):
             self.vae.decoder.incoming_skip_acts = self.vae.encoder.current_down_blocks
             self.vae.decoder.gamma = r
             output_image = self.vae.decode(x_denoised / self.vae.config.scaling_factor).sample.clamp(-1.0, 1.0)
-        return output_image
+        decoder_features = getattr(self.vae.decoder, "current_output_features", None)
+        # Do not let the decoder module retain the previous autograd graph
+        # between iterations. A local reference is sufficient for the head.
+        self.vae.decoder.current_output_features = None
+        if not return_mask:
+            return output_image
+        if self.spine_mask_head is None:
+            raise RuntimeError("return_mask=True requires a SliceFixer checkpoint with a spine-mask head.")
+        if decoder_features is None:
+            raise RuntimeError("VAE decoder did not expose current_output_features for the spine-mask head.")
+        head_dtype = next(self.spine_mask_head.parameters()).dtype
+        mask_logits = self.spine_mask_head(decoder_features.to(dtype=head_dtype))
+        return {
+            "ct_image": output_image,
+            "spine_mask_logits": mask_logits,
+        }
 
-    def save_model(self, outf):
+    def save_model(self, outf, global_step=None, training_metadata=None):
         sd = {}
         sd["unet_lora_target_modules"] = self.target_modules_unet
         sd["vae_lora_target_modules"] = self.target_modules_vae
@@ -363,4 +410,14 @@ class SliceFixer(torch.nn.Module):
             sd["state_dict_fusion_adapter"] = self.fusion_adapter.state_dict()
         sd["intensity_domain"] = INTENSITY_DOMAIN
         sd["xray_conditioning"] = XRAY_CONDITIONING if self.use_xray_conditioning else None
+        sd["spine_head_enabled"] = self.spine_mask_head is not None
+        if self.spine_mask_head is not None:
+            sd["state_dict_mask_head"] = self.spine_mask_head.state_dict()
+        if global_step is not None:
+            sd["global_step"] = int(global_step)
+        metadata = dict(self.training_metadata)
+        if training_metadata:
+            metadata.update(training_metadata)
+        if metadata:
+            sd["training_metadata"] = metadata
         torch.save(sd, outf)

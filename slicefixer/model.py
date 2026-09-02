@@ -56,6 +56,9 @@ def my_vae_decoder_fwd(self, sample, latent_embeds=None):
     else:
         sample = self.conv_norm_out(sample, latent_embeds)
     sample = self.conv_act(sample)
+    # Expose the shared high-resolution decoder representation to SliceFixer's
+    # optional spine-mask head. The CT branch remains the original conv_out.
+    self.current_output_features = sample
     sample = self.conv_out(sample)
     return sample
 

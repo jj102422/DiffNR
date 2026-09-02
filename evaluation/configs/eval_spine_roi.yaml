@@ -1,0 +1,96 @@
+dataset:
+  test_list: "/root/epfs/DiffNR/info.json"
+
+  eval_gt_root: "/root/epfs/test/gt_mask_new"
+  eval_gt_type: "mha"
+  eval_gt_pattern: "{case_id}/ct_file.mha"
+  eval_gt_axis_order: "ZYX"
+
+  eval_mask_root: "/root/epfs/data"
+  eval_mask_type: "npz_stack"
+  eval_mask_pattern: "{case_id}/mask/axial_*.npz"
+  eval_mask_key: "gt_mask"
+  eval_mask_axis_order: "ZYX"
+
+eval:
+  reference_space: "canonical_gt"
+  mask:
+    source: "GT spine mask"
+    roi_name: "GT spine mask"
+    binarize_threshold: 0.5
+    strict_shape: true
+  debug:
+    window_vmin: 0.0
+    window_vmax: 1800.0
+    overlay_mask_contour: true
+
+canonical:
+  axis_order: "ZYX"
+  ct_min: 0.0
+  ct_max: 3000.0
+  clip_before_metric: true
+  inputs_preclipped: true
+
+# Keep the same geometry corrections as the existing epfs_test evaluation so
+# the only experimental variable is the ROI.
+geometry_fix:
+  flip_z_all: true
+  transpose_xy_models:
+    - "NAF"
+    - "PerX2CT_SliceFixer_nomask"
+    - "PerX2CT_SliceFixer_nomask_post"
+    - "PerX2CT_SliceFixer_mask_full_ckpt"
+    - "PerX2CT_SliceFixer_2.5D"
+    - "PerX2CT_SliceFixer_maskguidance"
+    - "PerX2CT_refined_SliceFixer_mask"
+  flip_x_models:
+    - "DIF"
+    - "DIF_Net_CTSpine1K_current"
+    - "raw_3DGS"
+
+metric:
+  mae:
+    mae_primary: "raw"
+    output_both_raw_and_norm: true
+  psnr:
+    use_normalized: true
+    data_range: 1.0
+    eps: 1.0e-8
+  ssim:
+    enabled: true
+    use_normalized: true
+    data_range: 1.0
+    view: "axial"
+    min_mask_pixels_per_slice: 100
+    gaussian_weights: false
+    full_map_mask_average: true
+    mask_outside: true
+    background_value: 0.0
+  lpips:
+    enabled: true
+    view: "axial"
+    backbone: "alex"
+    device: "cuda"
+    batch_size: 16
+    cpu_num_threads: 4
+    resize_hw: [256, 256]
+    min_mask_pixels_per_slice: 100
+    bbox_padding: 8
+    mask_outside: true
+    background_value: 0.0
+
+runtime:
+  num_workers: 0
+  strict_shape_assert: true
+  allow_missing_cases: false
+  require_complete_matrix: true
+  fast_debug_stats: true
+  save_visual_check: true
+  visual_check_num_slices: 5
+
+output:
+  output_dir: "/root/epfs/test/evaluation_spine_roi"
+  per_case_csv: "per_case_metrics.csv"
+  summary_csv: "summary_metrics.csv"
+  debug_csv: "debug_alignment.csv"
+  failed_csv: "failed_cases.csv"

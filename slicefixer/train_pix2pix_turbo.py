@@ -42,6 +42,7 @@ from conditioning_utils import (
 )
 from intensity_utils import volume_to_slicefixer
 from my_utils.training_utils import parse_args_paired_training
+from spine_multitask import binary_mask_metrics, linear_warmup_weight, spine_segmentation_loss
 from volume_cache import TemporaryVolumeCache
 from r2_gaussian.utils.loss_utils import ssim as standard_ssim
 
@@ -236,17 +237,37 @@ def _slice_files(slice_dir):
     return paths
 
 
-def _slice_manifest_cache_valid(payload, case_paths, use_mask_conditioning, mask_relpath, require_mask_conditioning):
+def _slice_manifest_cache_valid(
+    payload,
+    case_paths,
+    use_mask_conditioning,
+    mask_relpath,
+    require_mask_conditioning,
+    use_spine_supervision=False,
+    spine_target_relpath="mask",
+    require_spine_target=False,
+):
     return (
-        payload.get("version") == 2
+        payload.get("version") == 3
         and payload.get("case_paths") == [str(p) for p in case_paths]
         and payload.get("use_mask_conditioning") == bool(use_mask_conditioning)
         and payload.get("mask_relpath") == str(mask_relpath)
         and payload.get("require_mask_conditioning") == bool(require_mask_conditioning)
+        and payload.get("use_spine_supervision") == bool(use_spine_supervision)
+        and payload.get("spine_target_relpath") == str(spine_target_relpath)
+        and payload.get("require_spine_target") == bool(require_spine_target)
     )
 
 
-def _build_slice_manifest(case_paths, use_mask_conditioning=False, mask_relpath="mask", require_mask_conditioning=False):
+def _build_slice_manifest(
+    case_paths,
+    use_mask_conditioning=False,
+    mask_relpath="mask",
+    require_mask_conditioning=False,
+    use_spine_supervision=False,
+    spine_target_relpath="mask",
+    require_spine_target=False,
+):
     manifest = {}
     for case_path in case_paths:
         case_path = str(case_path)
@@ -261,6 +282,7 @@ def _build_slice_manifest(case_paths, use_mask_conditioning=False, mask_relpath=
             continue
 
         mask_dir = None
+        mask_files = None
         if use_mask_conditioning:
             candidate_mask_dir = Path(case_path) / mask_relpath
             if candidate_mask_dir.is_dir():
@@ -272,6 +294,22 @@ def _build_slice_manifest(case_paths, use_mask_conditioning=False, mask_relpath=
                 else:
                     mask_dir = str(candidate_mask_dir)
             elif require_mask_conditioning:
+                continue
+
+        spine_target_dir = None
+        spine_target_files = None
+        if use_spine_supervision:
+            candidate_target_dir = Path(case_path) / spine_target_relpath
+            if candidate_target_dir.is_dir():
+                spine_target_files = _slice_files(candidate_target_dir)
+                missing_targets = [name for name in slice_names if name not in spine_target_files]
+                if missing_targets:
+                    if require_spine_target:
+                        continue
+                    spine_target_files = None
+                else:
+                    spine_target_dir = str(candidate_target_dir)
+            elif require_spine_target:
                 continue
 
         first_slice_name = slice_names[0]
@@ -288,14 +326,25 @@ def _build_slice_manifest(case_paths, use_mask_conditioning=False, mask_relpath=
                     continue
                 mask_dir = None
 
+        if use_spine_supervision and spine_target_dir is not None:
+            first_target_path = spine_target_files[first_slice_name]
+            first_target_shape, _, _ = get_volume_info(first_target_path)
+            if len(first_target_shape) != 2 or tuple(first_target_shape) != tuple(first_coarse_shape):
+                if require_spine_target:
+                    continue
+                spine_target_dir = None
+                spine_target_files = None
+
         manifest[case_path] = {
             "slice_names": slice_names,
             "pred_dir": pred_dir,
             "gt_dir": gt_dir,
             "mask_dir": mask_dir,
+            "spine_target_dir": spine_target_dir,
             "pred_files": pred_files,
             "gt_files": gt_files,
             "mask_files": mask_files if mask_dir is not None else None,
+            "spine_target_files": spine_target_files if spine_target_dir is not None else None,
         }
     return manifest
 
@@ -306,6 +355,9 @@ def load_or_build_slice_manifest(
     use_mask_conditioning=False,
     mask_relpath="mask",
     require_mask_conditioning=False,
+    use_spine_supervision=False,
+    spine_target_relpath="mask",
+    require_spine_target=False,
 ):
     cache_path = Path(cache_path)
     if cache_path.exists():
@@ -318,6 +370,9 @@ def load_or_build_slice_manifest(
                 use_mask_conditioning,
                 mask_relpath,
                 require_mask_conditioning,
+                use_spine_supervision,
+                spine_target_relpath,
+                require_spine_target,
             ):
                 return payload["cases"], True
         except Exception:
@@ -328,13 +383,19 @@ def load_or_build_slice_manifest(
         use_mask_conditioning=use_mask_conditioning,
         mask_relpath=mask_relpath,
         require_mask_conditioning=require_mask_conditioning,
+        use_spine_supervision=use_spine_supervision,
+        spine_target_relpath=spine_target_relpath,
+        require_spine_target=require_spine_target,
     )
     payload = {
-        "version": 2,
+        "version": 3,
         "case_paths": [str(p) for p in case_paths],
         "use_mask_conditioning": bool(use_mask_conditioning),
         "mask_relpath": str(mask_relpath),
         "require_mask_conditioning": bool(require_mask_conditioning),
+        "use_spine_supervision": bool(use_spine_supervision),
+        "spine_target_relpath": str(spine_target_relpath),
+        "require_spine_target": bool(require_spine_target),
         "cases": manifest,
     }
     cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -378,9 +439,14 @@ class MedicalCTDataset(torch.utils.data.Dataset):
         use_xray_conditioning=False,
         slice_context_radius=0,
         use_mask_conditioning=False,
+        mask_context_radius=None,
         mask_relpath="mask/ct_file.mha",
         mask_key=None,
         require_mask_conditioning=False,
+        use_spine_supervision=False,
+        spine_target_relpath="mask",
+        spine_target_key="gt_mask",
+        require_spine_target=False,
         volume_path_overrides=None,
         slice_case_manifest=None,
     ):
@@ -391,9 +457,18 @@ class MedicalCTDataset(torch.utils.data.Dataset):
         if self.slice_context_radius < 0:
             raise ValueError("--slice_context_radius must be non-negative.")
         self.use_mask_conditioning = use_mask_conditioning
+        self.mask_context_radius = (
+            self.slice_context_radius if mask_context_radius is None else int(mask_context_radius)
+        )
+        if self.mask_context_radius < 0:
+            raise ValueError("--mask_context_radius must be non-negative.")
         self.mask_relpath = mask_relpath
         self.mask_key = mask_key
         self.require_mask_conditioning = require_mask_conditioning
+        self.use_spine_supervision = bool(use_spine_supervision)
+        self.spine_target_relpath = spine_target_relpath
+        self.spine_target_key = spine_target_key
+        self.require_spine_target = bool(require_spine_target)
         self.input_ids = tokenizer(
             prompt,
             max_length=tokenizer.model_max_length,
@@ -448,12 +523,24 @@ class MedicalCTDataset(torch.utils.data.Dataset):
                 if mask_files is None and self.use_mask_conditioning and mask_dir is not None:
                     mask_files = {name: os.path.join(mask_dir, name) for name in slice_names}
                 case_conditioning["mask_files"] = mask_files
+                spine_target_files = slice_manifest.get("spine_target_files")
+                if self.use_spine_supervision and spine_target_files is None:
+                    target_dir = Path(case_path) / self.spine_target_relpath
+                    if target_dir.is_dir():
+                        candidates = _slice_files(target_dir)
+                        if all(name in candidates for name in slice_names):
+                            spine_target_files = candidates
+                if self.use_spine_supervision and self.require_spine_target and spine_target_files is None:
+                    raise FileNotFoundError(
+                        f"Missing complete spine targets under {Path(case_path) / self.spine_target_relpath}"
+                    )
                 self._volume_info[case_path] = case_conditioning
                 self._slice_case_info[case_path] = {
                     "slice_names": slice_names,
                     "pred_files": pred_files,
                     "gt_files": gt_files,
                     "mask_files": mask_files,
+                    "spine_target_files": spine_target_files,
                 }
                 for slice_pos, slice_name in enumerate(slice_names):
                     self.index_map.append(
@@ -503,6 +590,16 @@ class MedicalCTDataset(torch.utils.data.Dataset):
                             if self.require_mask_conditioning:
                                 continue
                             mask_files = None
+                spine_target_files = None
+                if self.use_spine_supervision:
+                    target_dir = Path(case_path) / self.spine_target_relpath
+                    if target_dir.is_dir():
+                        candidates = _slice_files(target_dir)
+                        missing_targets = [name for name in slice_names if name not in candidates]
+                        if not missing_targets:
+                            spine_target_files = candidates
+                    if spine_target_files is None and self.require_spine_target:
+                        continue
                 case_conditioning["mask_files"] = mask_files
                 self._volume_info[case_path] = case_conditioning
                 self._slice_case_info[case_path] = {
@@ -510,6 +607,7 @@ class MedicalCTDataset(torch.utils.data.Dataset):
                     "pred_files": pred_files,
                     "gt_files": gt_files,
                     "mask_files": mask_files,
+                    "spine_target_files": spine_target_files,
                 }
                 for slice_pos, slice_name in enumerate(slice_names):
                     coarse_path = pred_files[slice_name]
@@ -591,8 +689,9 @@ class MedicalCTDataset(torch.utils.data.Dataset):
             )
         return mask_volume
 
-    def _zero_mask_stack(self, coarse_stack):
-        return np.zeros_like(coarse_stack, dtype=np.float32)
+    def _zero_mask_stack(self, reference_stack):
+        mask_channels = 2 * self.mask_context_radius + 1
+        return np.zeros((mask_channels, *reference_stack.shape[1:]), dtype=np.float32)
 
     def _load_slice_mode_context(self, sample_info):
         case_path = sample_info["case_path"]
@@ -612,11 +711,16 @@ class MedicalCTDataset(torch.utils.data.Dataset):
         ).astype(np.float32)
         if self.use_mask_conditioning:
             mask_files = slice_info.get("mask_files")
+            mask_indices = clamped_context_indices(
+                sample_info["slice_pos"],
+                len(slice_names),
+                self.mask_context_radius,
+            )
             if mask_files is not None:
                 mask_stack = np.stack(
                     [
-                        (_load_array_file(mask_files[slice_names[i]], self.mask_key) > 0).astype(np.float32)
-                        for i in indices
+                        (_load_array_file(mask_files[slice_names[i]], self.mask_key) >= 0.5).astype(np.float32)
+                        for i in mask_indices
                     ],
                     axis=0,
                 )
@@ -646,7 +750,7 @@ class MedicalCTDataset(torch.utils.data.Dataset):
         mask_volume = self._volume_info[sample_info["case_path"]].get("mask_volume")
         if self.use_mask_conditioning:
             mask_stack = (
-                build_context_stack(mask_volume, sample_info["slice_idx"], self.slice_context_radius)
+                build_context_stack(mask_volume, sample_info["slice_idx"], self.mask_context_radius)
                 if mask_volume is not None
                 else self._zero_mask_stack(coarse_stack)
             )
@@ -664,6 +768,14 @@ class MedicalCTDataset(torch.utils.data.Dataset):
             coarse_stack = self._load_slice_mode_context(sample_info)
             coarse_slice = _load_array_file(sample_info["coarse_path"], sample_info["coarse_key"])
             gt_slice = _load_array_file(sample_info["gt_path"], sample_info["gt_key"])
+            if self.use_spine_supervision:
+                target_files = self._slice_case_info[case_path].get("spine_target_files")
+                if target_files is None:
+                    raise FileNotFoundError(f"No spine target files registered for {case_path}")
+                spine_target = _load_array_file(
+                    target_files[sample_info["slice_name"]],
+                    self.spine_target_key,
+                )
         else:
             # axial slice：axis 2 对应 Z 方向，因此这里沿最后一个维度取切片。
             coarse_stack = self._load_volume_mode_context(sample_info)
@@ -679,6 +791,8 @@ class MedicalCTDataset(torch.utils.data.Dataset):
                 sample_info["gt_key"],
                 self._mmap_cache,
             )
+            if self.use_spine_supervision:
+                raise ValueError("Spine supervision currently requires paired axial slice directories.")
 
         # 这里需要 copy 一份，避免 mmap 读出的只读 numpy 数组直接转 tensor 时触发警告。
         coarse_v = torch.from_numpy(coarse_stack.copy()).float()
@@ -699,6 +813,13 @@ class MedicalCTDataset(torch.utils.data.Dataset):
             "coarse_v_upper_clipped_ratio": (center_coarse_v > 1.0).float().mean(),
             "gt_v_upper_clipped_ratio": (gt_v > 1.0).float().mean(),
         }
+        if self.use_spine_supervision:
+            spine_target = (np.asarray(spine_target) >= 0.5).astype(np.float32)
+            if spine_target.shape != tuple(gt_v.shape[-2:]):
+                raise ValueError(
+                    f"Spine target shape {spine_target.shape} does not match CT target {tuple(gt_v.shape[-2:])}"
+                )
+            sample["spine_target"] = torch.from_numpy(spine_target.copy()).float().unsqueeze(0)
         if self.use_xray_conditioning:
             sample["xray_feat1"] = volume_info["xray_feat1"]
             sample["xray_feat2"] = volume_info["xray_feat2"]
@@ -721,6 +842,16 @@ def main(args):
 
     if args.seed is not None:
         set_seed(args.seed)
+    if args.mask_context_radius is None:
+        args.mask_context_radius = args.slice_context_radius
+    if args.mask_context_radius < 0:
+        raise ValueError("--mask_context_radius must be non-negative.")
+    if args.enable_spine_supervision and not args.require_spine_target:
+        raise ValueError("Spine supervision requires --require_spine_target to prevent silent target loss.")
+    if args.lambda_spine < 0 or args.lambda_spine_bce < 0:
+        raise ValueError("Spine loss weights must be non-negative.")
+    if not 0.0 < args.spine_mask_threshold < 1.0:
+        raise ValueError("--spine_mask_threshold must be between 0 and 1.")
 
     if accelerator.is_main_process:
         os.makedirs(os.path.join(args.output_dir, "checkpoints"), exist_ok=True)
@@ -729,11 +860,13 @@ def main(args):
     conditioning_in_channels = context_channel_count(
         args.slice_context_radius,
         use_mask_conditioning=args.use_mask_conditioning,
+        mask_context_radius=args.mask_context_radius,
     )
     if accelerator.is_main_process:
         print(
             f"SliceFixer conditioning channels: {conditioning_in_channels} "
             f"(slice_context_radius={args.slice_context_radius}, "
+            f"mask_context_radius={args.mask_context_radius}, "
             f"use_mask_conditioning={args.use_mask_conditioning})"
         )
 
@@ -745,7 +878,21 @@ def main(args):
         sd_turbo_path=args.pretrained_model_name_or_path,
         use_xray_conditioning=args.use_xray_conditioning,
         conditioning_in_channels=conditioning_in_channels,
+        enable_spine_head=args.enable_spine_supervision,
     )
+    net_pix2pix.training_metadata = {
+        "mask_condition_train_relpath": args.mask_relpath,
+        "mask_condition_test_relpath": args.val_pred_mask_relpath,
+        "spine_target_relpath": args.spine_target_relpath,
+        "spine_target_key": args.spine_target_key,
+        "lambda_spine": args.lambda_spine,
+        "lambda_spine_bce": args.lambda_spine_bce,
+        "spine_loss_warmup_steps": args.spine_loss_warmup_steps,
+        "pe_frequency_checkpoint": args.pe_frequency_checkpoint,
+        "pe_frequency_multires": args.pe_frequency_multires,
+        "pe_frequency_num_visible": args.pe_frequency_num_visible,
+        "pe_frequency_anneal_iters": args.pe_frequency_anneal_iters,
+    }
     net_pix2pix.set_train()
 
     if args.enable_xformers_memory_efficient_attention:
@@ -804,6 +951,10 @@ def main(args):
     if args.use_xray_conditioning:
         layers_to_opt += list(net_pix2pix.fusion_adapter.parameters())
     layers_to_opt += list(net_pix2pix.input_adapter.parameters())
+    if args.enable_spine_supervision:
+        if net_pix2pix.spine_mask_head is None:
+            raise RuntimeError("Spine supervision was enabled but the model has no spine-mask head.")
+        layers_to_opt += list(net_pix2pix.spine_mask_head.parameters())
     # 防止 conv_in、skip_conv 或 LoRA 参数在不同收集路径中被重复加入。
     layers_to_opt = unique_parameters(layers_to_opt)
 
@@ -850,7 +1001,8 @@ def main(args):
 
     manifest_dir = Path(args.output_dir) / "slice_manifests"
     train_manifest_path = manifest_dir / f"{args.train_split}.pkl"
-    val_manifest_path = manifest_dir / f"{args.val_split}.pkl"
+    val_manifest_path = manifest_dir / f"{args.val_split}_gtcond.pkl"
+    val_pred_manifest_path = manifest_dir / f"{args.val_split}_predcond.pkl"
     if accelerator.is_main_process:
         start_time = time.time()
         train_manifest, train_manifest_cached = load_or_build_slice_manifest(
@@ -859,6 +1011,9 @@ def main(args):
             use_mask_conditioning=args.use_mask_conditioning,
             mask_relpath=args.mask_relpath,
             require_mask_conditioning=args.require_mask_conditioning,
+            use_spine_supervision=args.enable_spine_supervision,
+            spine_target_relpath=args.spine_target_relpath,
+            require_spine_target=args.require_spine_target,
         )
         val_manifest, val_manifest_cached = load_or_build_slice_manifest(
             val_manifest_path,
@@ -866,16 +1021,37 @@ def main(args):
             use_mask_conditioning=args.use_mask_conditioning,
             mask_relpath=args.mask_relpath,
             require_mask_conditioning=args.require_mask_conditioning,
+            use_spine_supervision=args.enable_spine_supervision,
+            spine_target_relpath=args.spine_target_relpath,
+            require_spine_target=args.require_spine_target,
         )
+        val_pred_manifest = None
+        val_pred_manifest_cached = False
+        if args.enable_pred_mask_validation:
+            val_pred_manifest, val_pred_manifest_cached = load_or_build_slice_manifest(
+                val_pred_manifest_path,
+                val_case_paths,
+                use_mask_conditioning=args.use_mask_conditioning,
+                mask_relpath=args.val_pred_mask_relpath,
+                require_mask_conditioning=True,
+                use_spine_supervision=args.enable_spine_supervision,
+                spine_target_relpath=args.spine_target_relpath,
+                require_spine_target=args.require_spine_target,
+            )
         print(
             "Slice manifest ready: "
             f"train_cases={len(train_manifest)} ({'cached' if train_manifest_cached else 'built'}), "
             f"val_cases={len(val_manifest)} ({'cached' if val_manifest_cached else 'built'}), "
+            f"val_pred_cases={len(val_pred_manifest or {})} "
+            f"({'cached' if val_pred_manifest_cached else 'built' if val_pred_manifest is not None else 'disabled'}), "
             f"elapsed={time.time() - start_time:.1f}s"
         )
     accelerator.wait_for_everyone()
     train_slice_manifest = load_slice_manifest(train_manifest_path)
     val_slice_manifest = load_slice_manifest(val_manifest_path)
+    val_pred_slice_manifest = (
+        load_slice_manifest(val_pred_manifest_path) if args.enable_pred_mask_validation else None
+    )
 
     prompt = "high quality medical CT slice, clear anatomical structures"
     tokenizer = net_pix2pix.tokenizer
@@ -909,29 +1085,62 @@ def main(args):
                 kwargs["prefetch_factor"] = args.prefetch_factor
         return kwargs
 
-    dataset_val = MedicalCTDataset(
-        case_paths=val_case_paths,
-        tokenizer=tokenizer,
-        prompt=prompt,
-        use_xray_conditioning=args.use_xray_conditioning,
-        slice_context_radius=args.slice_context_radius,
-        use_mask_conditioning=args.use_mask_conditioning,
-        mask_relpath=args.mask_relpath,
-        mask_key=args.mask_key,
-        require_mask_conditioning=args.require_mask_conditioning,
-        volume_path_overrides=val_overrides,
-        slice_case_manifest=val_slice_manifest,
-    )
-    val_sample_count = min(args.num_samples_eval, len(dataset_val))
+    def build_validation_dataset(mask_relpath, slice_manifest):
+        return MedicalCTDataset(
+            case_paths=val_case_paths,
+            tokenizer=tokenizer,
+            prompt=prompt,
+            use_xray_conditioning=args.use_xray_conditioning,
+            slice_context_radius=args.slice_context_radius,
+            use_mask_conditioning=args.use_mask_conditioning,
+            mask_context_radius=args.mask_context_radius,
+            mask_relpath=mask_relpath,
+            mask_key=args.mask_key,
+            require_mask_conditioning=True if args.use_mask_conditioning else False,
+            use_spine_supervision=args.enable_spine_supervision,
+            spine_target_relpath=args.spine_target_relpath,
+            spine_target_key=args.spine_target_key,
+            require_spine_target=args.require_spine_target,
+            volume_path_overrides=val_overrides,
+            slice_case_manifest=slice_manifest,
+        )
+
+    dataset_val_gtcond = build_validation_dataset(args.mask_relpath, val_slice_manifest)
+    val_sample_count = min(args.num_samples_eval, len(dataset_val_gtcond))
     if val_sample_count == 0:
         raise ValueError("Validation split contains no readable volume slices.")
-    dataset_val = torch.utils.data.Subset(dataset_val, range(val_sample_count))
-    dl_val = torch.utils.data.DataLoader(
-        dataset_val,
+    # Keep validation fixed while covering all eval cases/axial positions rather
+    # than taking only the first case's first N (often empty-mask) slices.
+    val_sample_indices = np.linspace(
+        0,
+        len(dataset_val_gtcond) - 1,
+        num=val_sample_count,
+        dtype=np.int64,
+    ).tolist()
+    dataset_val_gtcond = torch.utils.data.Subset(dataset_val_gtcond, val_sample_indices)
+    dl_val_gtcond = torch.utils.data.DataLoader(
+        dataset_val_gtcond,
         batch_size=1,
         shuffle=False,
         **dataloader_kwargs(args.val_dataloader_num_workers),
     )
+    dl_val_predcond = None
+    if args.enable_pred_mask_validation:
+        dataset_val_predcond = build_validation_dataset(
+            args.val_pred_mask_relpath,
+            val_pred_slice_manifest,
+        )
+        if len(dataset_val_predcond) != len(dataset_val_gtcond.dataset):
+            raise ValueError(
+                "Pred-mask and GT-mask validation datasets do not have identical slice counts."
+            )
+        dataset_val_predcond = torch.utils.data.Subset(dataset_val_predcond, val_sample_indices)
+        dl_val_predcond = torch.utils.data.DataLoader(
+            dataset_val_predcond,
+            batch_size=1,
+            shuffle=False,
+            **dataloader_kwargs(args.val_dataloader_num_workers),
+        )
 
     def build_train_dataloader(case_paths, volume_path_overrides=None):
         dataset = MedicalCTDataset(
@@ -941,9 +1150,14 @@ def main(args):
             use_xray_conditioning=args.use_xray_conditioning,
             slice_context_radius=args.slice_context_radius,
             use_mask_conditioning=args.use_mask_conditioning,
+            mask_context_radius=args.mask_context_radius,
             mask_relpath=args.mask_relpath,
             mask_key=args.mask_key,
             require_mask_conditioning=args.require_mask_conditioning,
+            use_spine_supervision=args.enable_spine_supervision,
+            spine_target_relpath=args.spine_target_relpath,
+            spine_target_key=args.spine_target_key,
+            require_spine_target=args.require_spine_target,
             volume_path_overrides=volume_path_overrides,
             slice_case_manifest=train_slice_manifest,
         )
@@ -967,7 +1181,9 @@ def main(args):
         net_pix2pix, net_disc, optimizer, optimizer_disc, lr_scheduler, lr_scheduler_disc
     )
     disc_trainable_params = [param for param in net_disc.parameters() if param.requires_grad]
-    dl_val = accelerator.prepare(dl_val)
+    dl_val_gtcond = accelerator.prepare(dl_val_gtcond)
+    if dl_val_predcond is not None:
+        dl_val_predcond = accelerator.prepare(dl_val_predcond)
     net_lpips = accelerator.prepare(net_lpips)
     if net_clip is not None:
         net_clip = accelerator.prepare(net_clip)
@@ -1089,6 +1305,7 @@ def main(args):
 
     # start the training loop
     global_step = args.initial_global_step
+    best_val_predcond_roi_mae = float("inf")
     train_started = time.perf_counter()
     last_optimizer_step_time = train_started
     epoch = 0
@@ -1103,13 +1320,29 @@ def main(args):
                 B, C, H, W = x_src.shape
                 prompt_tokens = constant_prompt_tokens.expand(B, -1)
                 # forward pass
-                x_tgt_pred = net_pix2pix(
+                model_output = net_pix2pix(
                     x_src,
                     prompt_tokens=prompt_tokens,
                     xray_feat1=xray_feat1,
                     xray_feat2=xray_feat2,
                     deterministic=True,
+                    return_mask=args.enable_spine_supervision,
                 )
+                if args.enable_spine_supervision:
+                    x_tgt_pred = model_output["ct_image"]
+                    spine_mask_logits = model_output["spine_mask_logits"]
+                    spine_target = batch["spine_target"].cuda(non_blocking=True)
+                    if spine_mask_logits.shape[-2:] != spine_target.shape[-2:]:
+                        spine_mask_logits = F.interpolate(
+                            spine_mask_logits,
+                            size=spine_target.shape[-2:],
+                            mode="bilinear",
+                            align_corners=False,
+                        )
+                else:
+                    x_tgt_pred = model_output
+                    spine_mask_logits = None
+                    spine_target = None
                 # Reconstruction loss
                 loss_l2 = F.mse_loss(x_tgt_pred.float(), x_tgt.float(), reduction="mean") * args.lambda_l2
                 loss_lpips = torch.tensor(0.0, device=x_tgt_pred.device)
@@ -1151,8 +1384,25 @@ def main(args):
                         fake_for_g = make_disc_input(args, x_src, x_tgt_pred)
                         loss_gan = net_disc(fake_for_g, for_G=True).mean() * args.lambda_gan
 
-                # Total generator loss (paper formula)
-                loss = loss_l2 + loss_lpips + loss_clipsim + loss_gan + loss_ssim
+                loss_spine = torch.tensor(0.0, device=x_tgt_pred.device)
+                loss_spine_dice = torch.tensor(0.0, device=x_tgt_pred.device)
+                loss_spine_bce = torch.tensor(0.0, device=x_tgt_pred.device)
+                lambda_spine_current = 0.0
+                if args.enable_spine_supervision:
+                    raw_spine_loss, loss_spine_dice, loss_spine_bce = spine_segmentation_loss(
+                        spine_mask_logits,
+                        spine_target,
+                        bce_weight=args.lambda_spine_bce,
+                    )
+                    lambda_spine_current = linear_warmup_weight(
+                        global_step,
+                        args.lambda_spine,
+                        args.spine_loss_warmup_steps,
+                    )
+                    loss_spine = raw_spine_loss * lambda_spine_current
+
+                # Total generator loss: original 09 image terms plus spine supervision.
+                loss = loss_l2 + loss_lpips + loss_clipsim + loss_gan + loss_ssim + loss_spine
 
                 accelerator.backward(loss, retain_graph=False)
                 
@@ -1228,6 +1478,19 @@ def main(args):
                         logs["loss_ssim"] = loss_ssim.detach().item()
                     if args.lambda_gan > 0:
                         logs["loss_gan"] = loss_gan.detach().item()
+                    if args.enable_spine_supervision:
+                        train_mask_metrics = binary_mask_metrics(
+                            spine_mask_logits.detach(),
+                            spine_target,
+                            threshold=args.spine_mask_threshold,
+                        )
+                        logs["loss_spine"] = loss_spine.detach().item()
+                        logs["loss_spine_dice"] = loss_spine_dice.detach().item()
+                        logs["loss_spine_bce"] = loss_spine_bce.detach().item()
+                        logs["lambda_spine"] = lambda_spine_current
+                        logs["train/spine_dice"] = train_mask_metrics["dice"].item()
+                        logs["train/spine_precision"] = train_mask_metrics["precision"].item()
+                        logs["train/spine_recall"] = train_mask_metrics["recall"].item()
                     current_time = time.perf_counter()
                     logs["config/effective_batch_size"] = effective_batch_size
                     logs["timing/train_step_seconds"] = current_time - last_optimizer_step_time
@@ -1242,104 +1505,214 @@ def main(args):
                     progress_bar.set_postfix(**logs)
 
                     # viz some images
-                    if global_step % args.viz_freq == 1:
+                    if global_step % args.viz_freq == 0:
                         # 训练阶段把当前 batch 的 input / target / output 三个子图发到 wandb。
                         log_dict = {
                             "train/input": [wandb.Image(normalize_to_255(x_src[idx]), caption=f"input_{idx}") for idx in range(B)],
                             "train/target": [wandb.Image(normalize_to_255(x_tgt[idx]), caption=f"target(GT)_{idx}") for idx in range(B)],
                             "train/output": [wandb.Image(normalize_to_255(x_tgt_pred[idx]), caption=f"output_{idx}") for idx in range(B)],
                         }
+                        if args.enable_spine_supervision:
+                            log_dict["train/spine_target"] = [
+                                wandb.Image((spine_target[idx].detach().cpu() * 255).to(torch.uint8))
+                                for idx in range(B)
+                            ]
+                            log_dict["train/spine_probability"] = [
+                                wandb.Image(
+                                    (torch.sigmoid(spine_mask_logits[idx]).detach().cpu() * 255).to(torch.uint8)
+                                )
+                                for idx in range(B)
+                            ]
                         for k in log_dict:
                             logs[k] = log_dict[k]
 
                     # checkpoint the model
-                    if global_step % args.checkpointing_steps == 1:
+                    if global_step % args.checkpointing_steps == 0:
                         outf = os.path.join(args.output_dir, "checkpoints", f"model_{global_step}.pkl")
-                        accelerator.unwrap_model(net_pix2pix).save_model(outf)
+                        accelerator.unwrap_model(net_pix2pix).save_model(outf, global_step=global_step)
 
                 # Validation runs on every rank; rank 0 only aggregates and records.
-                if global_step % args.eval_freq == 1:
+                if global_step % args.eval_freq == 0:
                     validation_started = time.perf_counter()
                     fid_dir = os.path.join(args.output_dir, "eval", f"fid_{global_step}")
                     if accelerator.is_main_process and args.track_val_fid:
                         os.makedirs(fid_dir, exist_ok=True)
                     accelerator.wait_for_everyone()
 
-                    local_metrics = []
-                    val_preview = None
                     net_pix2pix.eval()
-                    with torch.inference_mode():
-                        for val_step, batch_val in enumerate(dl_val):
-                            val_src = batch_val["conditioning_pixel_values"].cuda(non_blocking=True)
-                            val_tgt = batch_val["output_pixel_values"].cuda(non_blocking=True)
-                            val_xray_feat1 = batch_val["xray_feat1"].cuda(non_blocking=True) if args.use_xray_conditioning else None
-                            val_xray_feat2 = batch_val["xray_feat2"].cuda(non_blocking=True) if args.use_xray_conditioning else None
-                            val_prompt_tokens = constant_prompt_tokens.expand(val_src.shape[0], -1)
-                            val_pred = net_pix2pix(
-                                val_src,
-                                prompt_tokens=val_prompt_tokens,
-                                xray_feat1=val_xray_feat1,
-                                xray_feat2=val_xray_feat2,
-                                deterministic=True,
-                            )
-                            val_ssim_loss, val_ssim = ssim_loss_and_value(val_pred, val_tgt)
-                            metric_values = [
-                                F.mse_loss(val_pred.float(), val_tgt.float(), reduction="mean"),
-                                net_lpips(val_pred.float(), val_tgt.float()).mean(),
-                                val_ssim_loss,
-                                val_ssim,
-                            ]
-                            if args.lambda_clipsim > 0:
-                                pred_renorm = t_clip_renorm(val_pred * 0.5 + 0.5)
-                                pred_renorm = F.interpolate(
-                                    pred_renorm, (224, 224), mode="bilinear", align_corners=False
+                    def evaluate_validation_loader(loader, prefix, save_fid=False):
+                        local_metrics = []
+                        val_preview = None
+                        with torch.inference_mode():
+                            for val_step, batch_val in enumerate(loader):
+                                val_src = batch_val["conditioning_pixel_values"].cuda(non_blocking=True)
+                                val_tgt = batch_val["output_pixel_values"].cuda(non_blocking=True)
+                                val_xray_feat1 = batch_val["xray_feat1"].cuda(non_blocking=True) if args.use_xray_conditioning else None
+                                val_xray_feat2 = batch_val["xray_feat2"].cuda(non_blocking=True) if args.use_xray_conditioning else None
+                                val_prompt_tokens = constant_prompt_tokens.expand(val_src.shape[0], -1)
+                                val_output = net_pix2pix(
+                                    val_src,
+                                    prompt_tokens=val_prompt_tokens,
+                                    xray_feat1=val_xray_feat1,
+                                    xray_feat2=val_xray_feat2,
+                                    deterministic=True,
+                                    return_mask=args.enable_spine_supervision,
                                 )
-                                caption_tokens = constant_clip_tokens.expand(val_src.shape[0], -1)
-                                clipsim, _ = net_clip(pred_renorm, caption_tokens)
-                                metric_values.append(clipsim.mean())
-                            local_metrics.append(torch.stack(metric_values))
-                            sample_index = int(batch_val["sample_index"][0].item())
-                            if val_preview is None or sample_index > val_preview[0]:
-                                val_preview = (
-                                    sample_index,
-                                    display_image_tensor(val_src[0]),
-                                    display_image_tensor(val_tgt[0]),
-                                    display_image_tensor(val_pred[0]),
-                                )
-                            if args.track_val_fid:
-                                output_pil = transforms.ToPILImage()(val_pred[0].cpu() * 0.5 + 0.5)
-                                outf = os.path.join(
-                                    fid_dir,
-                                    f"rank_{accelerator.process_index}_val_{val_step}.png",
-                                )
-                                output_pil.save(outf)
+                                if args.enable_spine_supervision:
+                                    val_pred = val_output["ct_image"]
+                                    val_mask_logits = val_output["spine_mask_logits"]
+                                    val_mask_target = batch_val["spine_target"].cuda(non_blocking=True)
+                                    if val_mask_logits.shape[-2:] != val_mask_target.shape[-2:]:
+                                        val_mask_logits = F.interpolate(
+                                            val_mask_logits,
+                                            size=val_mask_target.shape[-2:],
+                                            mode="bilinear",
+                                            align_corners=False,
+                                        )
+                                else:
+                                    val_pred = val_output
+                                    val_mask_logits = None
+                                    val_mask_target = None
+                                val_ssim_loss, val_ssim = ssim_loss_and_value(val_pred, val_tgt)
+                                metric_values = [
+                                    F.mse_loss(val_pred.float(), val_tgt.float(), reduction="mean"),
+                                    net_lpips(val_pred.float(), val_tgt.float()).mean(),
+                                    val_ssim_loss,
+                                    val_ssim,
+                                ]
+                                if args.enable_spine_supervision:
+                                    mask_pixels = val_mask_target.sum()
+                                    if mask_pixels > 0:
+                                        roi_mae_s = (
+                                            (val_pred.float() - val_tgt.float()).abs()
+                                            * val_mask_target.float()
+                                        ).sum() / (mask_pixels * val_pred.shape[1])
+                                        # SliceFixer s-space is [-1, 1], while the stored CT
+                                        # protocol is v*3000 with v=(s+1)/2.
+                                        roi_mae_raw = roi_mae_s * 1500.0
+                                    else:
+                                        roi_mae_s = torch.full((), float("nan"), device=val_pred.device)
+                                        roi_mae_raw = torch.full((), float("nan"), device=val_pred.device)
+                                    mask_metrics = binary_mask_metrics(
+                                        val_mask_logits,
+                                        val_mask_target,
+                                        threshold=args.spine_mask_threshold,
+                                    )
+                                    metric_values.extend(
+                                        [
+                                            roi_mae_s,
+                                            roi_mae_raw,
+                                            mask_metrics["dice"],
+                                            mask_metrics["precision"],
+                                            mask_metrics["recall"],
+                                        ]
+                                    )
+                                if args.lambda_clipsim > 0:
+                                    pred_renorm = t_clip_renorm(val_pred * 0.5 + 0.5)
+                                    pred_renorm = F.interpolate(
+                                        pred_renorm, (224, 224), mode="bilinear", align_corners=False
+                                    )
+                                    caption_tokens = constant_clip_tokens.expand(val_src.shape[0], -1)
+                                    clipsim, _ = net_clip(pred_renorm, caption_tokens)
+                                    metric_values.append(clipsim.mean())
+                                local_metrics.append(torch.stack(metric_values))
+                                sample_index = int(batch_val["sample_index"][0].item())
+                                if val_preview is None or sample_index > val_preview[0]:
+                                    preview_parts = [
+                                        display_image_tensor(val_src[0]),
+                                        display_image_tensor(val_tgt[0]),
+                                        display_image_tensor(val_pred[0]),
+                                    ]
+                                    if args.enable_spine_supervision:
+                                        preview_parts.extend(
+                                            [
+                                                val_mask_target[0].repeat(3, 1, 1),
+                                                torch.sigmoid(val_mask_logits[0]).repeat(3, 1, 1),
+                                            ]
+                                        )
+                                    val_preview = (sample_index, *preview_parts)
+                                if save_fid and args.track_val_fid:
+                                    output_pil = transforms.ToPILImage()(val_pred[0].cpu() * 0.5 + 0.5)
+                                    output_pil.save(
+                                        os.path.join(
+                                            fid_dir,
+                                            f"rank_{accelerator.process_index}_val_{val_step}.png",
+                                        )
+                                    )
 
-                    metrics = torch.stack(local_metrics)
-                    metrics = accelerator.gather_for_metrics(metrics).float().cpu().numpy()
-                    preview_indices = accelerator.gather(
-                        torch.tensor([val_preview[0]], device=val_src.device)
-                    ).cpu()
-                    preview_images = accelerator.gather(
-                        torch.stack(val_preview[1:]).unsqueeze(0)
-                    ).cpu()
+                        metrics = accelerator.gather_for_metrics(torch.stack(local_metrics)).float().cpu().numpy()
+                        preview_indices = accelerator.gather(
+                            torch.tensor([val_preview[0]], device=val_src.device)
+                        ).cpu()
+                        preview_images = accelerator.gather(
+                            torch.stack(val_preview[1:]).unsqueeze(0)
+                        ).cpu()
+                        result = {
+                            "l2": float(np.mean(metrics[:, 0])),
+                            "lpips": float(np.mean(metrics[:, 1])),
+                            "ssim_loss": float(np.mean(metrics[:, 2])),
+                            "ssim": float(np.mean(metrics[:, 3])),
+                        }
+                        next_index = 4
+                        if args.enable_spine_supervision:
+                            result.update(
+                                {
+                                    "spine_roi_mae_s": float(np.nanmean(metrics[:, next_index])),
+                                    "spine_roi_mae_raw": float(np.nanmean(metrics[:, next_index + 1])),
+                                    "spine_dice": float(np.mean(metrics[:, next_index + 2])),
+                                    "spine_precision": float(np.mean(metrics[:, next_index + 3])),
+                                    "spine_recall": float(np.mean(metrics[:, next_index + 4])),
+                                }
+                            )
+                            next_index += 5
+                        if args.lambda_clipsim > 0:
+                            result["clipsim"] = float(np.mean(metrics[:, next_index]))
+                        for name, value in result.items():
+                            logs[f"{prefix}/{name}"] = value
+                        preview = preview_images[int(torch.argmax(preview_indices).item())]
+                        logs[f"{prefix}/input"] = [wandb.Image(normalize_to_255(preview[0]))]
+                        logs[f"{prefix}/target"] = [wandb.Image(normalize_to_255(preview[1]))]
+                        logs[f"{prefix}/output"] = [wandb.Image(normalize_to_255(preview[2]))]
+                        if args.enable_spine_supervision:
+                            logs[f"{prefix}/spine_target"] = [wandb.Image(normalize_to_255(preview[3]))]
+                            logs[f"{prefix}/spine_probability"] = [wandb.Image(normalize_to_255(preview[4]))]
+                        return result
+
+                    gtcond_metrics = evaluate_validation_loader(
+                        dl_val_gtcond,
+                        "val_gtcond",
+                        save_fid=True,
+                    )
+                    predcond_metrics = None
+                    if dl_val_predcond is not None:
+                        predcond_metrics = evaluate_validation_loader(
+                            dl_val_predcond,
+                            "val_predcond",
+                            save_fid=False,
+                        )
                     net_pix2pix.train()
                     accelerator.wait_for_everyone()
                     if accelerator.is_main_process:
-                        logs["val/l2"] = float(np.mean(metrics[:, 0]))
-                        logs["val/lpips"] = float(np.mean(metrics[:, 1]))
-                        logs["val/ssim_loss"] = float(np.mean(metrics[:, 2]))
-                        logs["val/ssim"] = float(np.mean(metrics[:, 3]))
-                        if args.lambda_clipsim > 0:
-                            logs["val/clipsim"] = float(np.mean(metrics[:, 4]))
                         if args.track_val_fid:
                             curr_stats = get_folder_features(fid_dir, model=feat_model, num_workers=0, num=None,
                                     shuffle=False, seed=0, batch_size=8, device=torch.device("cuda"),
                                     mode="clean", custom_image_tranform=fn_transform, description="", verbose=True)
-                            logs["val/clean_fid"] = fid_from_feats(ref_stats, curr_stats)
-                        preview = preview_images[int(torch.argmax(preview_indices).item())]
-                        logs["val/input"] = [wandb.Image(normalize_to_255(preview[0]), caption="val_input")]
-                        logs["val/target"] = [wandb.Image(normalize_to_255(preview[1]), caption="val_target")]
-                        logs["val/output"] = [wandb.Image(normalize_to_255(preview[2]), caption="val_output")]
+                            logs["val_gtcond/clean_fid"] = fid_from_feats(ref_stats, curr_stats)
+                        if predcond_metrics is not None:
+                            current_roi_mae = predcond_metrics["spine_roi_mae_raw"]
+                            if np.isfinite(current_roi_mae) and current_roi_mae < best_val_predcond_roi_mae:
+                                best_val_predcond_roi_mae = current_roi_mae
+                                best_path = os.path.join(
+                                    args.output_dir,
+                                    "checkpoints",
+                                    "model_best_val_predcond_roi_mae.pkl",
+                                )
+                                accelerator.unwrap_model(net_pix2pix).save_model(
+                                    best_path,
+                                    global_step=global_step,
+                                    training_metadata={"best_val_predcond_roi_mae_raw": current_roi_mae},
+                                )
+                                logs["val_predcond/best_spine_roi_mae_raw"] = current_roi_mae
                         logs["timing/validation_seconds"] = (
                             time.perf_counter() - validation_started
                         )
@@ -1355,7 +1728,7 @@ def main(args):
         volume_cache.cleanup()
     if accelerator.is_main_process and global_step > 0:
         outf = os.path.join(args.output_dir, "checkpoints", f"model_{global_step}.pkl")
-        accelerator.unwrap_model(net_pix2pix).save_model(outf)
+        accelerator.unwrap_model(net_pix2pix).save_model(outf, global_step=global_step)
     accelerator.end_training()
 
 

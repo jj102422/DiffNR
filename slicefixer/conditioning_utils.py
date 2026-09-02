@@ -6,9 +6,14 @@ import numpy as np
 _AXIAL_SLICE_RE = re.compile(r"^axial_(\d+)\.(?:npz|npy)$")
 
 
-def context_channel_count(slice_context_radius, use_mask_conditioning=False):
+def context_channel_count(slice_context_radius, use_mask_conditioning=False, mask_context_radius=None):
     slice_channels = 2 * int(slice_context_radius) + 1
-    return slice_channels * (2 if use_mask_conditioning else 1)
+    if not use_mask_conditioning:
+        return slice_channels
+    if mask_context_radius is None:
+        mask_context_radius = slice_context_radius
+    mask_channels = 2 * int(mask_context_radius) + 1
+    return slice_channels + mask_channels
 
 
 def clamped_context_indices(center_idx, total_slices, slice_context_radius):

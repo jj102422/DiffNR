@@ -65,6 +65,7 @@ events.out.tfevents.*
 *.txt
 *.yaml
 *.yml
+!evaluation/configs/eval_spine_roi.yaml
 *.pkl
 
 # 新增：忽略 Weights & Biases (wandb) 的本地运行记录

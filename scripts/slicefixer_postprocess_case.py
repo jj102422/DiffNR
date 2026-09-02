@@ -63,6 +63,15 @@ def parse_args():
         help="Append binary segmentation mask slices to the conditioning input.",
     )
     parser.add_argument(
+        "--mask-context-radius",
+        type=int,
+        default=None,
+        help=(
+            "Number of neighboring mask slices to add on each side. "
+            "Defaults to --slice-context-radius; use 0 for current-slice mask only."
+        ),
+    )
+    parser.add_argument(
         "--mask-path",
         default=None,
         help="Optional segmentation mask slice directory or volume file. Passing this enables mask conditioning.",
@@ -70,6 +79,14 @@ def parse_args():
     parser.add_argument("--mask-relpath", default="mask")
     parser.add_argument("--mask-key", default=None, help="NPZ key when --mask-path points to a .npz mask.")
     parser.add_argument("--require-mask", action="store_true", help="Fail if no mask is found.")
+    parser.add_argument(
+        "--save-spine-mask",
+        action="store_true",
+        help="Require the checkpoint's spine head and save probability/binary mask volumes.",
+    )
+    parser.add_argument("--spine-mask-threshold", type=float, default=0.5)
+    parser.add_argument("--gt-mask-relpath", default="mask")
+    parser.add_argument("--gt-mask-key", default="gt_mask")
     return parser.parse_args()
 
 
@@ -111,7 +128,7 @@ def load_mask_slice(path, preferred_key=None):
     arr = np.squeeze(np.asarray(arr))
     if arr.ndim != 2:
         raise ValueError(f"Expected 2D mask slice, got shape={arr.shape} from {path}")
-    return (arr > 0).astype(np.float32)
+    return (arr >= 0.5).astype(np.float32)
 
 
 def load_xray_feature(path, device):
@@ -200,6 +217,76 @@ def save_nifti(path, volume):
     nib.save(image, str(path))
 
 
+def load_mask_slice_volume(mask_dir, pred_paths, preferred_key=None):
+    files = slice_files(mask_dir)
+    slices = []
+    missing = []
+    for pred_path in pred_paths:
+        path = files.get(pred_path.name)
+        if path is None:
+            missing.append(pred_path.name)
+        else:
+            slices.append(load_mask_slice(path, preferred_key))
+    if missing:
+        raise FileNotFoundError(
+            f"Missing mask slices under {mask_dir}: {missing[:10]}... total={len(missing)}"
+        )
+    return np.stack(slices, axis=-1).astype(np.float32)
+
+
+def overlay_mask(image, mask, color):
+    gray = Image.fromarray(to_uint8(image)).convert("RGB")
+    base = np.asarray(gray, dtype=np.float32).copy()
+    mask = np.asarray(mask) >= 0.5
+    tint = np.zeros_like(base)
+    tint[..., 0], tint[..., 1], tint[..., 2] = color
+    base[mask] = 0.55 * base[mask] + 0.45 * tint[mask]
+    return Image.fromarray(base.clip(0, 255).astype(np.uint8))
+
+
+def save_three_plane_mask_overlay(path, ct_volume, input_mask, predicted_mask, gt_mask):
+    if not (ct_volume.shape == input_mask.shape == predicted_mask.shape == gt_mask.shape):
+        raise ValueError(
+            "Overlay volume shape mismatch: "
+            f"ct={ct_volume.shape}, input={input_mask.shape}, "
+            f"pred={predicted_mask.shape}, gt={gt_mask.shape}"
+        )
+    positive = np.argwhere(gt_mask >= 0.5)
+    center = (
+        np.rint(positive.mean(axis=0)).astype(int)
+        if positive.size
+        else np.asarray(ct_volume.shape) // 2
+    )
+    x, y, z = [int(v) for v in center]
+    planes = [
+        ("axial", ct_volume[:, :, z], input_mask[:, :, z], predicted_mask[:, :, z], gt_mask[:, :, z]),
+        ("coronal", ct_volume[:, y, :].T, input_mask[:, y, :].T, predicted_mask[:, y, :].T, gt_mask[:, y, :].T),
+        ("sagittal", ct_volume[x, :, :].T, input_mask[x, :, :].T, predicted_mask[x, :, :].T, gt_mask[x, :, :].T),
+    ]
+    labels = ["CT", "input mask_pred", "internal mask", "GT mask"]
+    panel_size = 320
+    label_height = 28
+    canvas = Image.new("RGB", (panel_size * 4, (panel_size + label_height) * 3), "white")
+    draw = ImageDraw.Draw(canvas)
+    for row, (plane_name, ct, input_m, pred_m, gt_m) in enumerate(planes):
+        images = [
+            Image.fromarray(to_uint8(ct)).convert("RGB"),
+            overlay_mask(ct, input_m, (0, 255, 0)),
+            overlay_mask(ct, pred_m, (255, 64, 64)),
+            overlay_mask(ct, gt_m, (0, 200, 255)),
+        ]
+        top = row * (panel_size + label_height)
+        for column, image in enumerate(images):
+            image = image.resize((panel_size, panel_size), Image.Resampling.BILINEAR)
+            canvas.paste(image, (column * panel_size, top + label_height))
+            draw.text(
+                (column * panel_size + 6, top + 6),
+                f"{plane_name} | {labels[column]}",
+                fill=(0, 0, 0),
+            )
+    canvas.save(path)
+
+
 def load_gt_volume(gt_dir, slice_names, gt_key):
     slices = []
     missing = []
@@ -216,6 +303,12 @@ def load_gt_volume(gt_dir, slice_names, gt_key):
 
 def main():
     args = parse_args()
+    if args.mask_context_radius is None:
+        args.mask_context_radius = args.slice_context_radius
+    if args.mask_context_radius < 0:
+        raise ValueError("--mask-context-radius must be non-negative.")
+    if not 0.0 < args.spine_mask_threshold < 1.0:
+        raise ValueError("--spine-mask-threshold must be between 0 and 1.")
     rank, local_rank, world_size = get_distributed_info()
     dataset_root = Path(args.dataset_root)
     if args.case_id is None:
@@ -252,6 +345,12 @@ def main():
     shard_dir.mkdir(parents=True, exist_ok=True)
     if args.save_slices:
         slice_out_dir.mkdir(parents=True, exist_ok=True)
+    if rank == 0:
+        for stale_pattern in ("shard_rank*.npz", "metrics_rank*.csv"):
+            for stale_path in shard_dir.glob(stale_pattern):
+                stale_path.unlink()
+    if world_size > 1:
+        dist.barrier()
 
     if args.device == "cuda" and torch.cuda.is_available():
         device = torch.device(f"cuda:{local_rank}")
@@ -300,11 +399,13 @@ def main():
     conditioning_in_channels = context_channel_count(
         args.slice_context_radius,
         use_mask_conditioning=mask_volume is not None or mask_files is not None,
+        mask_context_radius=args.mask_context_radius,
     )
     print(
         f"Loading SliceFixer checkpoint: {args.checkpoint} "
         f"conditioning_channels={conditioning_in_channels} "
         f"slice_context_radius={args.slice_context_radius} "
+        f"mask_context_radius={args.mask_context_radius} "
         f"use_mask={mask_volume is not None or mask_files is not None}",
         flush=True,
     )
@@ -314,6 +415,8 @@ def main():
         conditioning_in_channels=conditioning_in_channels,
     ).to(device)
     model.set_eval()
+    if args.save_spine_mask and not model.spine_head_enabled:
+        raise ValueError("--save-spine-mask requires a checkpoint containing state_dict_mask_head.")
     if args.fp16:
         model.half()
         print(f"rank={rank} using fp16 inference", flush=True)
@@ -321,6 +424,7 @@ def main():
     xray_feat2 = load_xray_feature(xray_path2, device)
 
     outputs = []
+    mask_outputs = []
     metric_rows = []
     started = time.time()
     with torch.inference_mode():
@@ -335,7 +439,7 @@ def main():
                 context_positions = clamped_context_indices(
                     global_idx,
                     len(pred_paths),
-                    args.slice_context_radius,
+                    args.mask_context_radius,
                 )
                 if mask_files is not None:
                     mask_stack = np.stack(
@@ -355,20 +459,38 @@ def main():
             if args.fp16:
                 c_t = c_t.half()
 
-            out_s = model(
+            model_output = model(
                 c_t,
                 prompt=args.prompt,
                 xray_feat1=xray_feat1,
                 xray_feat2=xray_feat2,
                 deterministic=True,
+                return_mask=args.save_spine_mask,
             )
+            if args.save_spine_mask:
+                out_s = model_output["ct_image"]
+                mask_probability = torch.sigmoid(model_output["spine_mask_logits"].float())
+                mask_probability = F.interpolate(
+                    mask_probability,
+                    size=original_hw,
+                    mode="bilinear",
+                    align_corners=False,
+                )
+                mask_np = mask_probability.squeeze().cpu().numpy().astype(np.float32)
+                mask_outputs.append((global_idx, mask_np))
+            else:
+                out_s = model_output
             out_v = slicefixer_to_volume(out_s).mean(dim=1, keepdim=True)
             out_v = F.interpolate(out_v, size=original_hw, mode="bilinear", align_corners=False)
             out_np = out_v.squeeze().float().cpu().numpy().astype(np.float32)
             outputs.append((global_idx, out_np))
 
             if args.save_slices:
-                np.savez_compressed(slice_out_dir / pred_path.name, vol_pred=out_np)
+                payload = {"vol_pred": out_np}
+                if args.save_spine_mask:
+                    payload["mask_prob"] = mask_np
+                    payload["mask_pred"] = (mask_np >= args.spine_mask_threshold).astype(np.uint8)
+                np.savez_compressed(slice_out_dir / pred_path.name, **payload)
 
             gt_path = gt_dir / pred_path.name
             if gt_path.exists():
@@ -386,7 +508,12 @@ def main():
     else:
         shard_indices = np.empty((0,), dtype=np.int64)
         shard_slices = np.empty((0, 0, 0), dtype=np.float32)
-    np.savez_compressed(shard_dir / f"shard_rank{rank:03d}.npz", indices=shard_indices, slices=shard_slices)
+    shard_payload = {"indices": shard_indices, "slices": shard_slices}
+    if args.save_spine_mask:
+        shard_payload["mask_probabilities"] = np.stack(
+            [out for _, out in mask_outputs], axis=0
+        ).astype(np.float32) if mask_outputs else np.empty((0, 0, 0), dtype=np.float32)
+    np.savez_compressed(shard_dir / f"shard_rank{rank:03d}.npz", **shard_payload)
 
     if metric_rows:
         write_metrics_csv(shard_dir / f"metrics_rank{rank:03d}.csv", metric_rows)
@@ -396,15 +523,49 @@ def main():
 
     if rank == 0:
         ordered_slices = [None] * len(pred_paths)
+        ordered_mask_probabilities = [None] * len(pred_paths) if args.save_spine_mask else None
         for shard_path in sorted(shard_dir.glob("shard_rank*.npz")):
             with np.load(shard_path) as shard:
                 for idx, out_slice in zip(shard["indices"], shard["slices"]):
                     ordered_slices[int(idx)] = out_slice.astype(np.float32)
+                if args.save_spine_mask:
+                    for idx, mask_slice in zip(shard["indices"], shard["mask_probabilities"]):
+                        ordered_mask_probabilities[int(idx)] = mask_slice.astype(np.float32)
         missing = [idx for idx, out_slice in enumerate(ordered_slices) if out_slice is None]
         if missing:
             raise RuntimeError(f"Missing reconstructed slices: {missing[:10]}... total={len(missing)}")
         volume = np.stack(ordered_slices, axis=-1).astype(np.float32)
         np.savez_compressed(out_dir / "vol_pred_slicefixer.npz", vol_pred=volume)
+        if args.save_spine_mask:
+            missing_masks = [
+                idx for idx, mask_slice in enumerate(ordered_mask_probabilities) if mask_slice is None
+            ]
+            if missing_masks:
+                raise RuntimeError(
+                    f"Missing predicted mask slices: {missing_masks[:10]}... total={len(missing_masks)}"
+                )
+            mask_probability_volume = np.stack(ordered_mask_probabilities, axis=-1).astype(np.float32)
+            mask_prediction_volume = (
+                mask_probability_volume >= args.spine_mask_threshold
+            ).astype(np.uint8)
+            np.savez_compressed(out_dir / "spine_mask_prob.npz", mask_prob=mask_probability_volume)
+            np.savez_compressed(out_dir / "spine_mask_pred.npz", mask_pred=mask_prediction_volume)
+
+            if mask_files is not None:
+                input_mask_volume = load_mask_slice_volume(mask_path, pred_paths, args.mask_key)
+            elif mask_volume is not None:
+                input_mask_volume = mask_volume[:, :, : len(pred_paths)].astype(np.float32)
+            else:
+                raise RuntimeError("Spine-mask output requested without an input conditioning mask.")
+            gt_mask_dir = case_dir / args.gt_mask_relpath
+            gt_mask_volume = load_mask_slice_volume(gt_mask_dir, pred_paths, args.gt_mask_key)
+            save_three_plane_mask_overlay(
+                out_dir / "spine_mask_three_plane_overlay.png",
+                volume,
+                input_mask_volume,
+                mask_prediction_volume,
+                gt_mask_volume,
+            )
         if not args.skip_nifti:
             save_nifti(out_dir / "pred.nii.gz", volume)
             gt_volume = load_gt_volume(gt_dir, [path.name for path in pred_paths], args.gt_key)
@@ -433,6 +594,9 @@ def main():
     )
     if rank == 0:
         print(f"saved_volume={out_dir / 'vol_pred_slicefixer.npz'}", flush=True)
+        if args.save_spine_mask:
+            print(f"saved_spine_mask_probability={out_dir / 'spine_mask_prob.npz'}", flush=True)
+            print(f"saved_spine_mask_prediction={out_dir / 'spine_mask_pred.npz'}", flush=True)
         if not args.skip_nifti:
             print(f"saved_pred_nii={out_dir / 'pred.nii.gz'}", flush=True)
             print(f"saved_gt_nii={out_dir / 'gt.nii.gz'}", flush=True)

@@ -9,7 +9,7 @@ from typing import Any
 import numpy as np
 
 from .config_io import normalize_global_config
-from .mask_ops import as_bool_mask, resize_mask_to_shape
+from .mask_ops import as_bool_mask, load_mask_slice_stack, resize_mask_to_shape
 from .volume_io import load_volume
 
 
@@ -24,8 +24,14 @@ def _load_volume_cached(path: str, file_type: str | None, key: str | None, read_
     return load_volume(path, file_type=file_type, key=key, read_backend=read_backend)
 
 
+@lru_cache(maxsize=2)
+def _load_mask_stack_cached(path_pattern: str, key: str, threshold: float) -> np.ndarray:
+    return load_mask_slice_stack(path_pattern, key=key, threshold=threshold)
+
+
 def clear_volume_cache() -> None:
     _load_volume_cached.cache_clear()
+    _load_mask_stack_cached.cache_clear()
 
 
 @dataclass
@@ -68,23 +74,20 @@ def prepare_case_for_metric(
         ).copy()
         gt = apply_axis_order_to_zyx(gt, global_cfg["dataset"].get("eval_gt_axis_order", "ZYX"))
         gt = gt.astype(np.float32, copy=False)
-        debug.update(volume_stats("gt", gt))
+        if not fast_debug_stats(global_cfg):
+            debug.update(volume_stats("gt", gt))
         debug["gt_shape_raw"] = shape_text(gt.shape)
         debug["gt_shape"] = shape_text(gt.shape)
     except Exception as exc:
         raise StageError("load_gt", str(exc), paths) from exc
 
     try:
-        paths.mask_path = resolve_mask_path(case_id, global_cfg)
-        mask = _load_volume_cached(
-            paths.mask_path,
-            global_cfg["dataset"].get("eval_mask_type"),
-            global_cfg["dataset"].get("eval_mask_key"),
-            global_cfg["dataset"].get("eval_mask_read_backend"),
-        )
+        mask, paths.mask_path = load_evaluation_mask(case_id, global_cfg)
         mask = apply_axis_order_to_zyx(mask, global_cfg["dataset"].get("eval_mask_axis_order", "ZYX"))
-        threshold = mask_threshold(global_cfg)
-        mask = np.asarray(mask) > threshold
+        if mask.dtype != np.bool_:
+            mask = np.asarray(mask) > mask_threshold(global_cfg)
+        if mask_strict_shape(global_cfg) and tuple(mask.shape) != tuple(gt.shape):
+            raise ValueError(f"Strict mask shape mismatch: mask={mask.shape}, GT={gt.shape}")
         debug["mask_shape_raw"] = shape_text(mask.shape)
         debug["mask_shape"] = shape_text(mask.shape)
     except Exception as exc:
@@ -130,7 +133,8 @@ def prepare_case_for_metric(
 
     try:
         pred = align_prediction_to_gt(pred, gt, model_diet, global_cfg)
-        mask = resize_mask_to_shape(mask, gt.shape)
+        if tuple(mask.shape) != tuple(gt.shape):
+            mask = resize_mask_to_shape(mask, gt.shape)
 
         if global_cfg.get("canonical", {}).get("clip_before_metric", True):
             gt, pred = clip_to_eval_range(
@@ -158,8 +162,12 @@ def prepare_case_for_metric(
     if not np.isfinite(gt).all() or not np.isfinite(pred).all():
         raise StageError("validate", "GT and pred must be finite after preparation", paths)
 
-    debug.update(volume_stats("gt", gt))
-    debug.update(volume_stats("pred", pred))
+    if fast_debug_stats(global_cfg):
+        debug.update(volume_minmax_stats("gt", gt))
+        debug.update(volume_minmax_stats("pred", pred))
+    else:
+        debug.update(volume_stats("gt", gt))
+        debug.update(volume_stats("pred", pred))
     collect_prepare_warnings(gt, pred, mask, global_cfg, warnings)
     axis_cfg = runtime_pred_cfg(model_diet)
     align_cfg = runtime_align_cfg(model_diet)
@@ -170,6 +178,8 @@ def prepare_case_for_metric(
             "gt_path": paths.gt_path,
             "pred_path": paths.pred_path,
             "mask_path": paths.mask_path,
+            "mask_source": global_cfg.get("eval", {}).get("mask", {}).get("source", "GT mask"),
+            "roi_name": global_cfg.get("eval", {}).get("mask", {}).get("roi_name", "mask"),
             "align_strategy": align_cfg.get("strategy") or align_cfg.get("method"),
             "z_mode": align_cfg.get("z_mode"),
             "z_offset": align_cfg.get("z_offset"),
@@ -636,6 +646,30 @@ def resolve_mask_path(case_id: str, global_cfg: dict[str, Any]) -> str:
     return resolve_pattern(dataset["eval_mask_root"], dataset["eval_mask_pattern"], case_id)
 
 
+def load_evaluation_mask(case_id: str, global_cfg: dict[str, Any]) -> tuple[np.ndarray, str]:
+    dataset = global_cfg["dataset"]
+    mask_type = str(dataset.get("eval_mask_type", "")).lower().lstrip(".")
+    if mask_type == "npz_stack":
+        pattern = str(
+            Path(dataset["eval_mask_root"])
+            / dataset["eval_mask_pattern"].format(case_id=case_id, case=case_id, name=case_id)
+        )
+        key = dataset.get("eval_mask_key")
+        if not key:
+            raise ValueError("dataset.eval_mask_key is required for eval_mask_type=npz_stack")
+        mask = _load_mask_stack_cached(pattern, str(key), mask_threshold(global_cfg))
+        return mask, pattern
+
+    path = resolve_mask_path(case_id, global_cfg)
+    mask = _load_volume_cached(
+        path,
+        dataset.get("eval_mask_type"),
+        dataset.get("eval_mask_key"),
+        dataset.get("eval_mask_read_backend"),
+    )
+    return mask, path
+
+
 def resolve_pred_path(case_id: str, model_diet: dict[str, Any]) -> str:
     if model_diet.get("pred_path_pattern"):
         return resolve_full_pattern(model_diet["pred_path_pattern"], case_id)
@@ -685,8 +719,25 @@ def volume_stats(prefix: str, arr: np.ndarray) -> dict[str, float]:
     }
 
 
+def volume_minmax_stats(prefix: str, arr: np.ndarray) -> dict[str, float]:
+    return {
+        f"{prefix}_min": safe_min(arr),
+        f"{prefix}_max": safe_max(arr),
+        f"{prefix}_p1": float("nan"),
+        f"{prefix}_p99": float("nan"),
+    }
+
+
 def mask_threshold(global_cfg: dict[str, Any]) -> float:
     return float(global_cfg.get("eval", {}).get("mask", {}).get("binarize_threshold", 0.0))
+
+
+def mask_strict_shape(global_cfg: dict[str, Any]) -> bool:
+    return bool(global_cfg.get("eval", {}).get("mask", {}).get("strict_shape", False))
+
+
+def fast_debug_stats(global_cfg: dict[str, Any]) -> bool:
+    return bool(global_cfg.get("runtime", {}).get("fast_debug_stats", False))
 
 
 def fill_value_for_model(model_cfg: dict[str, Any], global_cfg: dict[str, Any]) -> float:
@@ -715,6 +766,10 @@ def collect_prepare_warnings(
     global_cfg: dict[str, Any],
     warnings: list[str],
 ) -> None:
+    if fast_debug_stats(global_cfg):
+        if int(mask.sum()) == 0:
+            warnings.append("empty mask")
+        return
     debug_cfg = global_cfg.get("eval", {}).get("debug", {})
     pred_p1 = safe_percentile(pred, 1)
     gt_p1 = safe_percentile(gt, 1)

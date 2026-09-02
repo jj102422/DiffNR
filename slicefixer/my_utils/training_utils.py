@@ -111,7 +111,16 @@ def parse_args_paired_training(input_args=None):
     parser.add_argument(
         "--use_mask_conditioning",
         action="store_true",
-        help="Append the same number of binary spine-mask slices to the conditioning input.",
+        help="Append binary spine-mask slices to the conditioning input.",
+    )
+    parser.add_argument(
+        "--mask_context_radius",
+        type=int,
+        default=None,
+        help=(
+            "Number of neighboring mask slices to condition on each side. "
+            "Defaults to --slice_context_radius; use 0 for current-slice mask only."
+        ),
     )
     parser.add_argument(
         "--mask_relpath",
@@ -130,6 +139,37 @@ def parse_args_paired_training(input_args=None):
         action="store_true",
         help="Skip cases without a readable mask instead of using zero mask channels.",
     )
+    parser.add_argument(
+        "--enable_spine_supervision",
+        action="store_true",
+        help="Enable the auxiliary one-channel spine-mask head and Dice+BCE supervision.",
+    )
+    parser.add_argument("--spine_target_relpath", default="mask", type=str)
+    parser.add_argument("--spine_target_key", default="gt_mask", type=str)
+    parser.add_argument(
+        "--require_spine_target",
+        action="store_true",
+        help="Fail manifest validation when any paired spine target is missing.",
+    )
+    parser.add_argument("--lambda_spine", default=0.1, type=float)
+    parser.add_argument("--lambda_spine_bce", default=0.5, type=float)
+    parser.add_argument("--spine_loss_warmup_steps", default=10_000, type=int)
+    parser.add_argument("--spine_mask_threshold", default=0.5, type=float)
+    parser.add_argument(
+        "--enable_pred_mask_validation",
+        action="store_true",
+        help="Also validate with deployment-time predicted masks.",
+    )
+    parser.add_argument("--val_pred_mask_relpath", default="mask_pred", type=str)
+    parser.add_argument(
+        "--pe_frequency_checkpoint",
+        default=None,
+        type=str,
+        help="Provenance-only path to the frozen upstream PE-frequency PerX2CT checkpoint.",
+    )
+    parser.add_argument("--pe_frequency_multires", default=10, type=int)
+    parser.add_argument("--pe_frequency_num_visible", default=6, type=int)
+    parser.add_argument("--pe_frequency_anneal_iters", default=0, type=int)
 
     # training details
     parser.add_argument("--output_dir", required=True)

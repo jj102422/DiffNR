@@ -30,6 +30,7 @@ DISPLAY_NAME = {
     "PerX2CT_SliceFixer_nomask": "PerX2CT w/SliceFixer",
     "PerX2CT_SliceFixer_nomask_post": "PerX2CT w/SliceFixer",
     "PerX2CT_SliceFixer_mask_full_ckpt": "PerX2CT w/SliceFixer++",
+    "PerX2CT_refined_SliceFixer_mask": "PerX2CT w/SliceFixer++",
 }
 
 
@@ -39,6 +40,15 @@ def display_name(model_name: str) -> str:
 
 # 论文展示顺序微调: 互换这两个 model 的位置(DiffNR 排在 r²-Gaussian w/SliceFixer 之前)
 DISPLAY_SWAP_PAIRS = [("3DGS_SliceFixer_iterative", "3DGS_SliceFixer_post")]
+
+PAPER_INPUT_LAYOUT_EXCLUDED_MODELS = {
+    "PerX2CT_high_frequency_mask",
+    "PerX2CT_SliceFixer_nomask",
+    "PerX2CT_SliceFixer_nomask_post",
+    "PerX2CT_SliceFixer_2.5D",
+    "PerX2CT_SliceFixer_maskguidance",
+    "PerX2CT_refined_SliceFixer_mask",
+}
 
 
 def reorder_for_display(names: list[str]) -> list[str]:
@@ -64,16 +74,41 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ct_max", type=float, default=None)
     parser.add_argument("--transpose_layout", action="store_true", help="转置布局: 三视图为行、各 model 为列(图更宽更矮, 适合论文排版)")
     parser.add_argument("--group_cols", type=int, default=None, help="转置布局下每组列数; 列超过该值则分成多组上下堆叠(组间加粗虚线分隔)")
+    parser.add_argument("--paper_input_layout", action="store_true", help="论文图布局: 去掉 PerX2CT no-mask, 第一列插入 input X-ray, raw_3DGS 顺延到第二组第一列")
+    parser.add_argument("--input_xrays", nargs=2, default=None, metavar=("XRAY1_PFM", "XRAY2_PFM"), help="paper_input_layout 下插入的两张 PFM X-ray")
+    parser.add_argument("--input_title", default="Input")
+    parser.add_argument("--input_window", nargs=2, type=float, default=None, metavar=("VMIN", "VMAX"), help="Input X-ray 显示窗; 不传则使用百分位自动窗")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     global_cfg = normalize_global_config(load_yaml(args.eval_config))
+    three_plane_cfg = global_cfg.get("runtime", {}).get("three_plane_compare", {})
+    paper_input_layout = bool(args.paper_input_layout or three_plane_cfg.get("paper_input_layout", False))
+    input_xrays = format_optional_paths(
+        args.input_xrays if args.input_xrays is not None else three_plane_cfg.get("input_xrays"),
+        case_id=args.case_id,
+    )
+    input_title = args.input_title if args.input_title != "Input" else str(three_plane_cfg.get("input_title", args.input_title))
+    input_window = tuple(args.input_window) if args.input_window else optional_float_pair(three_plane_cfg.get("input_window"))
+    input_windows = optional_window_list(three_plane_cfg.get("input_windows"))
+    input_gap_px = int(three_plane_cfg.get("input_gap_px", 0))
+    input_title_gap_px = int(three_plane_cfg.get("input_title_gap_px", 32))
+    if args.input_window:
+        input_windows = None
+    if paper_input_layout and not input_xrays:
+        raise ValueError("--paper_input_layout requires --input_xrays XRAY1_PFM XRAY2_PFM")
     model_diet_all = normalize_model_diet_config(load_yaml(args.model_diet))
     model_names = resolve_model_names(args.models, model_diet_all)
     if args.models is None:  # 仅在用默认配置顺序时应用展示顺序微调; 显式 --models 时尊重用户顺序
         model_names = reorder_for_display(model_names)
+    if paper_input_layout:
+        model_names = [
+            name
+            for name in model_names
+            if name not in PAPER_INPUT_LAYOUT_EXCLUDED_MODELS
+        ]
     out_dir = output_dir_from_config(global_cfg, args.output_dir)
 
     gt = mask = None
@@ -97,9 +132,16 @@ def main() -> None:
     # GT 放在最后(最右列/最后一行), 便于与最终模型对比
     rows.append({"name": "GT", "model": "GT", "vol": gt, "debug": {}})
 
-    three_plane_cfg = global_cfg.get("runtime", {}).get("three_plane_compare", {})
     rows, mask, crop_note = apply_display_crop_z(rows, mask, debug_rows, three_plane_cfg)
-    z, y, x = choose_indices(mask, args.z, args.y, args.x)
+    slice_cfg = three_plane_cfg.get("slice_indices", {})
+    input_z = args.z if args.z is not None else slice_cfg.get("z")
+    input_y = args.y if args.y is not None else slice_cfg.get("y")
+    input_x = args.x if args.x is not None else slice_cfg.get("x")
+    # ITK-SNAP reports cursor coordinates as x,y,z. In this ZYX/numpy display
+    # space, the matching coronal/sagittal slices use swapped X/Y indices.
+    display_y = input_x
+    display_x = input_y
+    z, y, x = choose_indices(mask, input_z, display_y, display_x)
     intensity_cfg = three_plane_cfg.get("intensity", {})
     ct_min = float(args.ct_min if args.ct_min is not None else intensity_cfg.get("window_vmin", global_cfg["canonical"]["ct_min"]))
     ct_max = float(args.ct_max if args.ct_max is not None else intensity_cfg.get("window_vmax", global_cfg["canonical"]["ct_max"]))
@@ -122,9 +164,16 @@ def main() -> None:
         per_row_window=per_row_window,
         transpose_layout=transpose_layout,
         group_cols=group_cols,
+        input_xrays=input_xrays if paper_input_layout else None,
+        input_title=input_title,
+        input_window=input_window,
+        input_windows=input_windows,
+        input_gap_px=input_gap_px,
+        input_title_gap_px=input_title_gap_px,
     )
     print(f"[ok] wrote {out_path}")
-    print(f"slices: axial z={z}, coronal y={y}, sagittal x={x}")
+    print(f"input ITK-SNAP cursor: x={input_x}, y={input_y}, z={input_z}")
+    print(f"mapped slices: axial z={z}, coronal y={y}, sagittal x={x}")
     if crop_note:
         print(crop_note)
     if failed:
@@ -149,6 +198,30 @@ def clamp_index(idx: int, size: int) -> int:
     return max(0, min(int(idx), size - 1))
 
 
+def optional_float_pair(value: Any) -> tuple[float, float] | None:
+    if value is None:
+        return None
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        raise ValueError(f"Expected a two-value window, got {value!r}")
+    return float(value[0]), float(value[1])
+
+
+def optional_window_list(value: Any) -> list[tuple[float, float]] | None:
+    if value is None:
+        return None
+    if not isinstance(value, (list, tuple)):
+        raise ValueError(f"Expected a list of windows, got {value!r}")
+    return [optional_float_pair(item) for item in value]
+
+
+def format_optional_paths(value: Any, *, case_id: str) -> list[str] | None:
+    if value is None:
+        return None
+    if not isinstance(value, (list, tuple)):
+        raise ValueError(f"Expected a list of paths, got {value!r}")
+    return [str(path).format(case_id=case_id) for path in value]
+
+
 def save_three_plane_grid(
     rows: list[dict[str, Any]],
     out_path: Path,
@@ -163,6 +236,12 @@ def save_three_plane_grid(
     per_row_window: bool = False,
     transpose_layout: bool = False,
     group_cols: int | None = None,
+    input_xrays: list[str] | None = None,
+    input_title: str = "Input",
+    input_window: tuple[float, float] | None = None,
+    input_windows: list[tuple[float, float]] | None = None,
+    input_gap_px: int = 0,
+    input_title_gap_px: int = 32,
 ) -> None:
     import matplotlib
 
@@ -187,6 +266,8 @@ def save_three_plane_grid(
             vmin, vmax = ct_min, ct_max
         panels = {plane: make_plane(vol, z, y, x, plane_cfg, model, plane) for plane in planes}
         entries.append({"name": name, "p1": p1, "p99": p99, "vmin": vmin, "vmax": vmax, "panels": panels})
+    if input_xrays:
+        entries.insert(0, make_input_entry(input_xrays, input_title, planes, input_window=input_window, input_windows=input_windows, input_gap_px=input_gap_px, input_title_gap_px=input_title_gap_px))
 
     if transpose_layout:
         # 转置: 三视图为行, 各 model 为列; 列数超过 group_cols 时分多组上下堆叠
@@ -208,10 +289,18 @@ def save_three_plane_grid(
                     axes[r][c].axis("off")
                 if c < len(group_entries):
                     e = group_entries[c]
-                    axes[0][c].set_title(e["name"], fontsize=10)
-                    for r_idx, plane in enumerate(planes):
-                        axes[r_idx][c].imshow(e["panels"][plane], cmap="gray", vmin=e["vmin"], vmax=e["vmax"], aspect="equal")
-            sf.subplots_adjust(left=0.005, right=0.995, top=0.94, bottom=0.005, wspace=0.02, hspace=0.02)
+                    if e.get("is_input"):
+                        for r in range(3):
+                            axes[r][c].set_visible(False)
+                        span = axes[0][c].get_subplotspec().get_gridspec()[:, c]
+                        ax = sf.add_subplot(span)
+                        show_input_canvas(ax, e)
+                        ax.axis("off")
+                    else:
+                        axes[0][c].set_title(e["name"], fontsize=10)
+                        for r_idx, plane in enumerate(planes):
+                            show_entry_panel(axes[r_idx][c], e, plane)
+            sf.subplots_adjust(left=0.005, right=0.995, top=0.94, bottom=0.005, wspace=0.02, hspace=0.0)
         # 组间粗虚线分隔
         for g in range(1, n_groups):
             y = 1.0 - g / n_groups
@@ -227,7 +316,7 @@ def save_three_plane_grid(
         for row_idx, e in enumerate(entries):
             for col_idx, plane in enumerate(planes):
                 ax = axes[row_idx][col_idx]
-                ax.imshow(e["panels"][plane], cmap="gray", vmin=e["vmin"], vmax=e["vmax"], aspect="equal")
+                show_entry_panel(ax, e, plane)
                 ax.axis("off")
                 if col_idx == 0:
                     ax.text(-0.12, 0.5, e["name"], transform=ax.transAxes, ha="right", va="center", fontsize=9)
@@ -250,6 +339,163 @@ def robust_range(vol: np.ndarray) -> tuple[float, float]:
     if finite.size == 0:
         return float("nan"), float("nan")
     return float(np.percentile(finite, 1)), float(np.percentile(finite, 99))
+
+
+def make_input_entry(
+    input_xrays: list[str],
+    input_title: str,
+    planes: tuple[str, ...],
+    input_window: tuple[float, float] | None = None,
+    input_windows: list[tuple[float, float]] | None = None,
+    input_gap_px: int = 0,
+    input_title_gap_px: int = 32,
+) -> dict[str, Any]:
+    xray1 = load_pfm(input_xrays[0])
+    xray2 = np.fliplr(load_pfm(input_xrays[1]))
+    if input_windows is not None:
+        if len(input_windows) != 2:
+            raise ValueError(f"Expected two input X-ray windows, got {input_windows!r}")
+        xray1 = window_to_unit(xray1, input_windows[0])
+        xray2 = window_to_unit(xray2, input_windows[1])
+        input_window = (0.0, 1.0)
+    canvas = make_centered_input_canvas([xray1, xray2], gap_px=input_gap_px)
+    panel_h = canvas.shape[0] // 3
+    panels = {
+        planes[0]: canvas[:panel_h],
+        planes[1]: canvas[panel_h : 2 * panel_h],
+        planes[2]: canvas[2 * panel_h :],
+    }
+    windows = {}
+    for plane, panel in panels.items():
+        if input_window is not None:
+            vmin, vmax = input_window
+        elif np.isfinite(panel).any():
+            vmin, vmax = robust_range(panel)
+        else:
+            vmin, vmax = 0.0, 1.0
+        windows[plane] = (vmin, vmax)
+    return {
+        "name": input_title,
+        "model": "__input_xrays__",
+        "is_input": True,
+        "canvas": canvas,
+        "panels": panels,
+        "windows": windows,
+        "window": input_window,
+        "title_gap_px": int(input_title_gap_px),
+    }
+
+
+def window_to_unit(img: np.ndarray, window: tuple[float, float]) -> np.ndarray:
+    vmin, vmax = window
+    if vmax <= vmin:
+        raise ValueError(f"Invalid input X-ray window {window!r}")
+    arr = np.asarray(img, dtype=np.float32)
+    return np.clip((arr - vmin) / (vmax - vmin), 0.0, 1.0)
+
+
+def make_centered_input_canvas(images: list[np.ndarray], gap_px: int = 0) -> np.ndarray:
+    shapes = [np.asarray(img).shape[:2] for img in images]
+    panel_h = max(h for h, _ in shapes)
+    panel_w = max(w for _, w in shapes)
+    canvas = np.full((panel_h * 3, panel_w), np.nan, dtype=np.float32)
+    gap = max(0, int(gap_px))
+    center_lines = [panel_h - gap // 2, panel_h * 2 + (gap - gap // 2)]
+    for img, center_y in zip(images, center_lines):
+        paste_centered(canvas, np.asarray(img, dtype=np.float32), center_y)
+    return canvas
+
+
+def paste_centered(canvas: np.ndarray, img: np.ndarray, center_y: int) -> None:
+    h, w = img.shape[:2]
+    top = int(round(center_y - h / 2))
+    left = int(round((canvas.shape[1] - w) / 2))
+    src_y0 = max(0, -top)
+    src_x0 = max(0, -left)
+    dst_y0 = max(0, top)
+    dst_x0 = max(0, left)
+    copy_h = min(h - src_y0, canvas.shape[0] - dst_y0)
+    copy_w = min(w - src_x0, canvas.shape[1] - dst_x0)
+    if copy_h <= 0 or copy_w <= 0:
+        return
+    canvas[dst_y0 : dst_y0 + copy_h, dst_x0 : dst_x0 + copy_w] = img[src_y0 : src_y0 + copy_h, src_x0 : src_x0 + copy_w]
+
+
+def show_input_canvas(ax: Any, entry: dict[str, Any]) -> None:
+    import matplotlib.pyplot as plt
+
+    canvas = np.asarray(entry["canvas"], dtype=np.float32)
+    window = entry.get("window")
+    if window is not None:
+        vmin, vmax = window
+    else:
+        vmin, vmax = robust_range(canvas)
+    cmap = plt.get_cmap("gray").copy()
+    cmap.set_bad("white")
+    ax.set_facecolor("white")
+    ax.imshow(np.ma.masked_invalid(canvas), cmap=cmap, vmin=vmin, vmax=vmax, aspect="equal")
+    draw_input_title(ax, entry, canvas)
+
+
+def draw_input_title(ax: Any, entry: dict[str, Any], canvas: np.ndarray) -> None:
+    finite_rows = np.where(np.isfinite(canvas).any(axis=1))[0]
+    if finite_rows.size == 0:
+        y = 0.98
+    else:
+        top = int(finite_rows[0])
+        gap = max(0, int(entry.get("title_gap_px", 32)))
+        y = 1.0 - max(0, top - gap) / float(canvas.shape[0])
+        y = min(0.98, max(0.0, y))
+    ax.text(0.5, y, str(entry["name"]), transform=ax.transAxes, ha="center", va="bottom", fontsize=10, color="black")
+
+
+def load_pfm(path: str | Path) -> np.ndarray:
+    path = Path(path)
+    with path.open("rb") as f:
+        header = f.readline().decode("ascii").strip()
+        if header not in {"Pf", "PF"}:
+            raise ValueError(f"Unsupported PFM header {header!r} in {path}")
+        dims = f.readline().decode("ascii").strip()
+        while dims.startswith("#") or not dims:
+            dims = f.readline().decode("ascii").strip()
+        width, height = map(int, dims.split())
+        scale = float(f.readline().decode("ascii").strip())
+        endian = "<" if scale < 0 else ">"
+        data = np.fromfile(f, endian + "f")
+    channels = 3 if header == "PF" else 1
+    expected = width * height * channels
+    if data.size != expected:
+        raise ValueError(f"PFM size mismatch in {path}: expected {expected} floats, got {data.size}")
+    if channels == 3:
+        array = data.reshape((height, width, 3))[:, :, ::-1]
+    else:
+        array = data.reshape((height, width))
+    return np.flipud(array).astype(np.float32, copy=False)
+
+
+def show_entry_panel(ax: Any, entry: dict[str, Any], plane: str) -> None:
+    img = entry["panels"][plane]
+    if entry.get("is_input"):
+        ax.set_facecolor("white")
+        if not np.isfinite(img).any():
+            ax.axis("off")
+            return
+        if np.asarray(img).ndim == 3:
+            vals = np.asarray(img, dtype=np.float32)
+            finite = vals[np.isfinite(vals)]
+            lo = float(np.percentile(finite, 1)) if finite.size else 0.0
+            hi = float(np.percentile(finite, 99)) if finite.size else 1.0
+            display = np.clip((vals - lo) / max(hi - lo, 1.0e-6), 0.0, 1.0)
+            ax.imshow(display, aspect="equal")
+            return
+        import matplotlib.pyplot as plt
+
+        vmin, vmax = entry["windows"][plane]
+        cmap = plt.get_cmap("gray").copy()
+        cmap.set_bad("white")
+        ax.imshow(np.ma.masked_invalid(img), cmap=cmap, vmin=vmin, vmax=vmax, aspect="equal")
+        return
+    ax.imshow(img, cmap="gray", vmin=entry["vmin"], vmax=entry["vmax"], aspect="equal")
 
 
 def model_label(model_name: str, debug: dict) -> str:

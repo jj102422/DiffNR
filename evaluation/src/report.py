@@ -8,6 +8,8 @@ from typing import Iterable
 PER_CASE_COLUMNS = [
     "model",
     "case_id",
+    "roi_name",
+    "mask_source",
     "MAE",
     "MAE_raw",
     "MAE_norm",
@@ -28,6 +30,8 @@ FAILED_COLUMNS = ["model", "case_id", "stage", "error", "error_message", "gt_pat
 DEBUG_COLUMNS = [
     "model",
     "case_id",
+    "roi_name",
+    "mask_source",
     "gt_path",
     "pred_path",
     "mask_path",
@@ -126,6 +130,8 @@ def summarize_metrics(rows: list[dict], model_order: Iterable[str] | None = None
             "model": model,
             "num_cases": int(len(g)),
             "n_cases": int(len(g)),
+            "roi_name": _join_unique(g.get("roi_name", [])),
+            "mask_source": _join_unique(g.get("mask_source", [])),
             "alignment_quality": _join_unique(g.get("alignment_quality", [])),
             "notes": _join_unique(g.get("notes", [])),
         }
@@ -157,6 +163,9 @@ def print_markdown_summary(summary_df) -> None:
     if summary_df is None or summary_df.empty:
         print("No successful cases to summarize.")
         return
+    roi_names = _join_unique(summary_df.get("roi_name", []))
+    if roi_names:
+        print(f"ROI: {roi_names}")
     print("| Model | N | MAE ↓ | LPIPS ↓ | PSNR ↑ | SSIM ↑ |")
     print("|---|---:|---:|---:|---:|---:|")
     for _, row in summary_df.iterrows():

@@ -55,6 +55,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--models", nargs="*", default=None)
     parser.add_argument("--output_dir", default=None)
     parser.add_argument("--case_limit", type=int, default=None)
+    parser.add_argument("--case_shard_index", type=int, default=0)
+    parser.add_argument("--case_shard_count", type=int, default=1)
     parser.add_argument("--no_visual_check", action="store_true")
     return parser.parse_args()
 
@@ -70,6 +72,11 @@ def main() -> None:
     test_cases = read_test_list(global_cfg["dataset"]["test_list"])
     if args.case_limit is not None:
         test_cases = test_cases[: args.case_limit]
+    if args.case_shard_count < 1:
+        raise ValueError("--case_shard_count must be >= 1")
+    if not 0 <= args.case_shard_index < args.case_shard_count:
+        raise ValueError("--case_shard_index must be in [0, case_shard_count)")
+    test_cases = test_cases[args.case_shard_index :: args.case_shard_count]
 
     output_dir = output_dir_from_config(global_cfg, args.output_dir)
     lpips_runner = None
@@ -83,15 +90,24 @@ def main() -> None:
     visual_counts = {model: 0 for model in model_names}
     visual_limit = int(global_cfg.get("runtime", {}).get("visual_check_num_slices", 5))
     save_visual = bool(global_cfg.get("runtime", {}).get("save_visual_check", True)) and not args.no_visual_check
+    roi_cfg = global_cfg.get("eval", {}).get("mask", {})
+    roi_name = str(roi_cfg.get("roi_name", "mask"))
+    mask_source = str(roi_cfg.get("source", "GT mask"))
 
     enabled_models = [m for m in model_names if model_diet_all["models"][m].get("enabled", True)]
+    diets = {
+        model_name: build_runtime_diet(
+            global_cfg,
+            model_diet_all["models"][model_name],
+            lpips_runner=lpips_runner,
+        )
+        for model_name in enabled_models
+    }
     progress = tqdm(total=len(enabled_models) * len(test_cases), desc="eval", unit="case")
-    for model_name in model_names:
-        model_cfg = model_diet_all["models"][model_name]
-        if not model_cfg.get("enabled", True):
-            continue
-        Diet = build_runtime_diet(global_cfg, model_cfg, lpips_runner=lpips_runner)
-        for case_id in test_cases:
+    for case_id in test_cases:
+        for model_name in enabled_models:
+            model_cfg = model_diet_all["models"][model_name]
+            Diet = diets[model_name]
             progress.set_postfix_str(f"{model_name} {case_id}")
             try:
                 gt, pred, mask, debug = prepare_case_for_metric(case_id, model_name, global_cfg, model_cfg)
@@ -103,6 +119,8 @@ def main() -> None:
                     {
                         "model": model_name,
                         "case_id": case_id,
+                        "roi_name": roi_name,
+                        "mask_source": mask_source,
                         **result,
                         "alignment_quality": debug.get("alignment_quality"),
                         "allow_metric": debug.get("allow_metric"),
@@ -130,6 +148,7 @@ def main() -> None:
                         ct_min=float(global_cfg.get("eval", {}).get("debug", {}).get("window_vmin", global_cfg["canonical"]["ct_min"])),
                         ct_max=float(global_cfg.get("eval", {}).get("debug", {}).get("window_vmax", global_cfg["canonical"]["ct_max"])),
                         title_extra=f"{model_name} {case_id} {debug.get('alignment_quality', '')}",
+                        overlay_mask=bool(global_cfg.get("eval", {}).get("debug", {}).get("overlay_mask_contour", False)),
                     )
                     visual_counts[model_name] += 1
             except Exception as exc:
@@ -143,8 +162,24 @@ def main() -> None:
 
     progress.close()
     save_standard_outputs(rows, debug_rows, failed_rows, global_cfg, output_dir, model_order=model_names)
+    if global_cfg.get("runtime", {}).get("require_complete_matrix", False):
+        validate_complete_matrix(rows, enabled_models, test_cases)
     summary = summarize_metrics(rows, model_order=model_names)
     print_markdown_summary(summary)
+
+
+def validate_complete_matrix(rows: list[dict], model_names: list[str], case_ids: list[str]) -> None:
+    expected = {(model, case_id) for model in model_names for case_id in case_ids}
+    actual = [(str(row["model"]), str(row["case_id"])) for row in rows]
+    duplicates = sorted({item for item in actual if actual.count(item) > 1})
+    missing = sorted(expected - set(actual))
+    unexpected = sorted(set(actual) - expected)
+    if duplicates or missing or unexpected or len(actual) != len(expected):
+        raise RuntimeError(
+            "Incomplete evaluation matrix: "
+            f"expected={len(expected)}, actual={len(actual)}, "
+            f"missing={missing[:10]}, duplicates={duplicates[:10]}, unexpected={unexpected[:10]}"
+        )
 
 
 def failure_row(model_name: str, case_id: str, exc: Exception) -> dict:

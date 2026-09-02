@@ -58,6 +58,7 @@ def save_three_plane_check(
     ct_min: float = -1024.0,
     ct_max: float = 1000.0,
     title_extra: str = "",
+    overlay_mask: bool = False,
 ) -> None:
     import matplotlib
 
@@ -68,6 +69,7 @@ def save_three_plane_check(
     out_path.parent.mkdir(parents=True, exist_ok=True)
     z, y, x = choose_center_indices(mask)
     err = np.abs(pred.astype(np.float32) - gt.astype(np.float32))
+    mask_panels = [mask[z], mask[:, y, :], mask[:, :, x]]
     rows = [
         ("GT", [gt[z], gt[:, y, :], gt[:, :, x]], ct_min, ct_max),
         ("pred", [pred[z], pred[:, y, :], pred[:, :, x]], ct_min, ct_max),
@@ -80,6 +82,10 @@ def save_three_plane_check(
         for col_idx, img in enumerate(panels):
             ax = axes[row_idx][col_idx]
             ax.imshow(img, cmap="gray", vmin=vmin, vmax=vmax, aspect="equal")
+            if overlay_mask:
+                mask_panel = mask_panels[col_idx]
+                if np.any(mask_panel) and not np.all(mask_panel):
+                    ax.contour(mask_panel.astype(np.float32), levels=[0.5], colors=["#ff8c00"], linewidths=0.6)
             ax.axis("off")
             if col_idx == 0:
                 ax.text(-0.08, 0.5, label, transform=ax.transAxes, ha="right", va="center", fontsize=9)

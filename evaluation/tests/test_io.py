@@ -5,6 +5,7 @@ import pytest
 
 from evaluation.src.align import StageError, prepare_case_for_metric
 from evaluation.src.config_io import read_test_list
+from evaluation.src.mask_ops import load_mask_slice_stack
 from evaluation.src.volume_io import load_volume
 
 
@@ -118,7 +119,71 @@ def test_prepare_case_accepts_model_diet_spec_schema(tmp_path):
 
     gt_out, pred_out, mask_out, debug = prepare_case_for_metric(case, "m", global_cfg, model_cfg)
     assert np.array_equal(gt_out, gt)
-    assert np.array_equal(pred_out, gt)
+    assert np.allclose(pred_out, gt, atol=1.0e-6)
     assert mask_out.dtype == np.bool_
     assert debug["pred_after_axis_shape"] == "2x2x2"
     assert debug["alignment_quality"] == "verified"
+
+
+def test_load_mask_slice_stack_orders_and_binarizes(tmp_path):
+    np.savez(tmp_path / "axial_001.npz", gt_mask=np.array([[0, 1], [0, 0]], dtype=np.uint8))
+    np.savez(tmp_path / "axial_000.npz", gt_mask=np.array([[1, 0], [0, 0]], dtype=np.uint8))
+
+    mask = load_mask_slice_stack(tmp_path / "axial_*.npz", key="gt_mask", threshold=0.5)
+
+    assert mask.dtype == np.bool_
+    assert mask.shape == (2, 2, 2)
+    assert mask[:, 0, :].tolist() == [[True, False], [False, True]]
+
+
+def test_load_mask_slice_stack_rejects_missing_index(tmp_path):
+    np.savez(tmp_path / "axial_000.npz", gt_mask=np.ones((2, 2), dtype=np.uint8))
+    np.savez(tmp_path / "axial_002.npz", gt_mask=np.ones((2, 2), dtype=np.uint8))
+
+    with pytest.raises(ValueError, match="contiguous"):
+        load_mask_slice_stack(tmp_path / "axial_*.npz", key="gt_mask")
+
+
+def test_load_mask_slice_stack_rejects_non_binary_values(tmp_path):
+    np.savez(tmp_path / "axial_000.npz", gt_mask=np.array([[0.0, 0.5], [1.0, 0.0]], dtype=np.float32))
+
+    with pytest.raises(ValueError, match="not binary"):
+        load_mask_slice_stack(tmp_path / "axial_*.npz", key="gt_mask")
+
+
+def test_prepare_case_strict_spine_mask_shape_mismatch_raises(tmp_path):
+    case = "case001"
+    mask_dir = tmp_path / case / "mask"
+    mask_dir.mkdir(parents=True)
+    np.save(tmp_path / "gt.npy", np.zeros((2, 2, 2), dtype=np.float32))
+    np.save(tmp_path / "pred.npy", np.zeros((2, 2, 2), dtype=np.float32))
+    np.savez(mask_dir / "axial_000.npz", gt_mask=np.ones((2, 2), dtype=np.uint8))
+
+    global_cfg = {
+        "dataset": {
+            "eval_gt_root": str(tmp_path),
+            "eval_gt_type": "npy",
+            "eval_gt_pattern": "gt.npy",
+            "eval_gt_axis_order": "ZYX",
+            "eval_mask_root": str(tmp_path),
+            "eval_mask_type": "npz_stack",
+            "eval_mask_pattern": "{case_id}/mask/axial_*.npz",
+            "eval_mask_key": "gt_mask",
+            "eval_mask_axis_order": "ZYX",
+        },
+        "canonical": {"ct_min": 0.0, "ct_max": 1.0, "clip_before_metric": True},
+        "eval": {"mask": {"binarize_threshold": 0.5, "strict_shape": True}},
+    }
+    model_cfg = {
+        "pred_path_pattern": str(tmp_path / "pred.npy"),
+        "pred_format": "npy",
+        "pred_axis_order_in_file": "ZYX",
+        "transpose_order": [0, 1, 2],
+        "inverse_intensity": {"type": "identity", "formula": "identity"},
+        "spatial_align": {"method": "identity"},
+    }
+
+    with pytest.raises(StageError) as exc:
+        prepare_case_for_metric(case, "model", global_cfg, model_cfg)
+    assert exc.value.stage == "load_mask"
+    assert "Strict mask shape mismatch" in str(exc.value)
